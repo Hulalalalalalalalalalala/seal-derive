@@ -22,7 +22,7 @@ python3 -m seal_derive --root ./state init
 
 - `init() -> None` 建立空密钥环。
 - `seal(key_id, material, password=None, iterations=200_000) -> int` 封存材料并返回版本号；给出 `password` 时以 PBKDF2-HMAC-SHA256 派生密钥加密并认证原始 material，持正确口令可完整取回。
-- `load(key_id, version=None, password=None) -> bytes` 取回**原始 material 的 UTF-8 bytes**（不是派生值）；`version` 缺省取当前活动版本。受口令版本必须传 `password`：缺少口令抛含“缺少口令”的 `ValueError`，口令错误抛含“口令不匹配”的 `ValueError`，记录被篡改、截断或参数不全抛含“记录损坏”的 `ValueError`。旧的仅保存派生值的 `pbkdf2-sha256` 记录无法恢复原 material，抛含“不可恢复的旧记录”的 `ValueError`。
+- `load(key_id, version=None, password=None) -> bytes` 取回**原始 material 的 UTF-8 bytes**（不是派生值）；`version` 缺省取当前活动版本。一次 load 的版本解析（含缺省时读 active）、吊销校验与解密在同一共享锁快照内完成：并发的 `revoke`/`set_active` 要么在 load 开始前已提交（load 见到新状态），要么等 load 结束后才能提交，已完成的 load 不被稍后的变更追溯否定。解析到已吊销版本抛 `RevokedVersionError`（消息含“已吊销”，CLI 退出码 2）。受口令版本必须传 `password`：缺少口令抛含“缺少口令”的 `ValueError`，口令错误抛含“口令不匹配”的 `ValueError`，记录被篡改、截断或参数不全抛含“记录损坏”的 `ValueError`。旧的仅保存派生值的 `pbkdf2-sha256` 记录无法恢复原 material，抛含“不可恢复的旧记录”的 `ValueError`。
 - `versions(key_id) -> list[int]` 升序返回全部版本。
 - `active(key_id) -> int` 当前活动版本。
 - `set_active(key_id, version) -> None` 把活动版本指向已有历史版本。

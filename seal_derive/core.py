@@ -414,11 +414,26 @@ class KeyRing:
     def load(self, key_id: str, version: int | None = None, password: str | None = None) -> bytes:
         self._check_key_id(key_id)
         version = self._check_version(version)
-        record = self._record(key_id, version)
+        # One shared-lock snapshot for the whole open: resolving the version
+        # (including the default, which reads ``active``), checking revocation
+        # and decrypting all see the same committed document. A concurrent
+        # revoke/set-active either committed before this snapshot (its new
+        # state is used) or waits for the shared lock and only commits once the
+        # load has finished -- never a revoked record handed back as material,
+        # a half-resolved active, or fields read mid-change.
+        with _locked(self, exclusive=False):
+            entry = self._entry(self._read(), key_id)
+            record = self._record_in(entry, key_id, version)
+            return self._material_from(record, key_id, password)
+
+    # Call only while holding the load snapshot: the record is fresh from the
+    # document read under the shared lock and no writer can commit until this
+    # returns, so revocation state observed here stays true through decrypt.
+    def _material_from(self, record: dict, key_id: str, password: str | None) -> bytes:
         if not isinstance(record, dict) or "scheme" not in record:
             raise CorruptRecordError("记录损坏：缺少封存方案")
         if record.get("revoked"):
-            raise RevokedVersionError(f"version {record.get('version', version)!r} of {key_id!r} 已吊销")
+            raise RevokedVersionError(f"version {record.get('version')!r} of {key_id!r} 已吊销")
         scheme = record["scheme"]
         if scheme == PLAIN_SCHEME:
             return _b64_field(record, "material")
