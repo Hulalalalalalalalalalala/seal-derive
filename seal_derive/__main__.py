@@ -90,7 +90,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except (KeyError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
-        return USAGE_ERROR
+        # Unknown identifiers are usage errors (2); every other validation
+        # or verification failure is a storage/check failure (1).
+        return USAGE_ERROR if isinstance(error, KeyError) else 1
 
 
 if __name__ == "__main__":
