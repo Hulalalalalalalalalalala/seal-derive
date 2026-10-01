@@ -32,13 +32,14 @@ python3 -m seal_derive --root ./state init
 ## 约定
 
 - 所有写操作立即持久化；进程被杀死后 `recover`/`init` 之外的重开不得丢失已确认的写。
+- 所有修改（`init`/`seal`/`set_active`/`revoke`）共用同一把跨进程写锁（目录内 `.keyring.lock`，标准库 `flock`/`msvcrt`，无第三方依赖），在锁内完成读取、校验、变更与 `keyring.json` 的原子替换；读操作取共享锁，配合临时文件 + `os.replace` 不会读到半份文件。
+- 等待写锁超过 5 秒抛 `TimeoutError`（文本“获取密钥环写锁超时”，CLI 退出码 1）；持锁进程被强制结束或崩溃后锁由内核自动释放，后续调用在等待窗口内自动接管，不删除或改写 `keyring.json`。
 - 非法输入抛出 `ValueError`，未知标识抛出 `KeyError`。
 - 退出码：0 成功，1 存储或校验错误，2 用法错误。
 
 ## 限制
 
 - 未实现密钥材料的内存清零与常时比较。
-- 未实现多进程并发写保护。
 - 派生参数只支持 PBKDF2-HMAC-SHA256。
 
 ## 语料

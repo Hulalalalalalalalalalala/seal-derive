@@ -82,6 +82,11 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except TimeoutError as error:
+        # Another process/caller held the cross-process write lock for over
+        # five seconds. Storage-level failure, not a usage mistake.
+        print(f"error: {error}", file=sys.stderr)
+        return 1
     except json.JSONDecodeError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

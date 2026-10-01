@@ -4,17 +4,39 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
+import errno
 import hashlib
 import hmac
 import json
 import os
 import secrets
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 __all__ = ["KeyRing"]
 
 RING_FILE = "keyring.json"
+#: Sibling file carrying the cross-process exclusive write lock. It is never
+#: business state: it is only a lock byte stream and may be created/removed
+#: freely; keyring.json itself is never touched while taking over a lock.
+LOCK_FILE = ".keyring.lock"
+#: Wait this long for the write lock before reporting a timeout, both across
+#: processes and between callers (threads) in one process.
+LOCK_TIMEOUT_SECONDS = 5.0
+_LOCK_POLL_SECONDS = 0.05
+_TMP_GLOB = ".keyring-*.tmp"
+
+try:  # POSIX
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
+try:  # Windows
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX has no msvcrt
+    msvcrt = None
 
 PLAIN_SCHEME = "plain"
 #: Older passphrase records that only stored the derived value: the original
@@ -114,16 +136,130 @@ def _positive_int_field(record: dict, name: str) -> int:
     return value
 
 
+class _FileLock:
+    """A cross-process lock backed by an OS advisory lock on one file.
+
+    POSIX uses ``flock`` (associated with the open file description, released
+    automatically when the process dies, however it dies); Windows uses
+    ``msvcrt.locking`` (byte-range LOCKFILE_EXCLUSIVE_LOCK with the same
+    auto-release on process exit semantics). A caller killed with SIGKILL or
+    crashing while holding the lock therefore can never leave a permanent
+    stale lock: the kernel releases it, and the next waiter takes over within
+    the polling window -- no rewriting or deleting of keyring.json is needed.
+    """
+
+    def __init__(self, path: Path, exclusive: bool, timeout: float) -> None:
+        self.path = path
+        self.exclusive = exclusive
+        self.timeout = timeout
+        self.handle: int | None = None
+
+    def __enter__(self) -> "_FileLock":
+        self.handle = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            self._acquire()
+        except BaseException:
+            os.close(self.handle)
+            self.handle = None
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.handle is None:
+            return
+        try:
+            self._release()
+        finally:
+            os.close(self.handle)
+            self.handle = None
+
+    def _acquire(self) -> None:
+        deadline = time.monotonic() + self.timeout
+        while True:
+            if self._try_lock():
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError("获取密钥环写锁超时")
+            time.sleep(_LOCK_POLL_SECONDS)
+
+    def _try_lock(self) -> bool:
+        if fcntl is not None:
+            operation = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+            try:
+                fcntl.flock(self.handle, operation | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    raise
+                return False
+            return True
+        # Windows: lock one byte at the start of the file.
+        mode = msvcrt.LK_NBLCK if self.exclusive else msvcrt.LK_NBRLCK
+        try:
+            msvcrt.locking(self.handle, mode, 1)
+        except OSError as error:
+            if error.errno not in (errno.EDEADLK, errno.EACCES, errno.EAGAIN):
+                raise
+            return False
+        return True
+
+    def _release(self) -> None:
+        if fcntl is not None:
+            fcntl.flock(self.handle, fcntl.LOCK_UN)
+        else:
+            os.lseek(self.handle, 0, os.SEEK_SET)
+            msvcrt.locking(self.handle, msvcrt.LK_UNLCK, 1)
+
+
+@contextlib.contextmanager
+def _locked(ring: "KeyRing", exclusive: bool):
+    """Serialise same-process callers (threads) then take the OS file lock.
+
+    Both gates share one five-second budget: a caller that has not entered the
+    critical section after that long gets ``TimeoutError``, whether it waited
+    on another thread in this process or on another process holding the file.
+
+    ``init`` creates ``root`` before locking. Any other call against a missing
+    ``root`` fails here (or in ``_read`` for a directory without keyring.json)
+    with the same ``FileNotFoundError`` text as in the single-process baseline;
+    there is no check-then-act window in which such a call could write.
+    """
+    deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+    if not ring._caller_lock.acquire(timeout=LOCK_TIMEOUT_SECONDS):
+        raise TimeoutError("获取密钥环写锁超时")
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("获取密钥环写锁超时")
+        try:
+            with _FileLock(ring.lock_path, exclusive, remaining):
+                yield
+        except FileNotFoundError:
+            # The lock file's parent directory vanished under us: report the
+            # uninitialised ring, identical wording to _read().
+            raise FileNotFoundError(
+                f"no key ring at {ring.path}; run init first") from None
+    finally:
+        ring._caller_lock.release()
+
+
 class KeyRing:
-    """A single-process key ring rooted at ``root``."""
+    """A key ring rooted at ``root``, safe for concurrent processes/callers."""
 
     def __init__(self, root: str | Path) -> None:
         self.directory = Path(root)
         self.path = self.directory / RING_FILE
+        self.lock_path = self.directory / LOCK_FILE
+        # This only serialises threads sharing this KeyRing instance before
+        # they contend for the cross-process file lock.
+        self._caller_lock = threading.RLock()
 
     def init(self) -> None:
+        # Create the directory before taking the lock: the lock file needs a
+        # home, and mkdir is idempotent. The empty-document write itself is
+        # still serialised like every other mutation.
         self.directory.mkdir(parents=True, exist_ok=True)
-        self._write({"keys": {}})
+        with _locked(self, exclusive=True):
+            self._write({"keys": {}})
 
     def _read(self) -> dict:
         if not self.path.is_file():
@@ -140,6 +276,14 @@ class KeyRing:
         self.directory.mkdir(parents=True, exist_ok=True)
         if self.path.exists() and not os.access(self.path, os.W_OK):
             raise PermissionError(f"key ring file is not writable: {self.path}")
+        # The exclusive write lock is held here, so any sibling temp files are
+        # leftovers of a process that died mid-write; its rename either
+        # completed or never happened, so these partial documents are dead.
+        for leftover in self.directory.glob(_TMP_GLOB):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
         payload = json.dumps(document, sort_keys=True, indent=2)
         # Write to a sibling temp file, fsync it, then atomically replace
         # keyring.json: a crash leaves either the old or the new document.
@@ -210,51 +354,62 @@ class KeyRing:
         key_id = self._check_key_id(key_id)
         if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
             raise ValueError("iterations must be positive")
-        document = self._read()
-        if key_id in document["keys"]:
-            entry = self._entry(document, key_id)
-        else:
-            entry = {"versions": [], "active": 0}
-            document["keys"][key_id] = entry
-        version = max((self._version_number(item, key_id) for item in entry["versions"]), default=0) + 1
-        if password is None:
-            record = {"version": version, "scheme": PLAIN_SCHEME,
-                      "material": base64.b64encode(material.encode("utf-8")).decode("ascii")}
-        else:
-            plaintext = material.encode("utf-8")
-            salt = secrets.token_bytes(_SALT_BYTES)
-            derived = _derive(password, salt, iterations, 3 * _KEY_BYTES)
-            enc_key, mac_key, check_key = derived[:_KEY_BYTES], derived[_KEY_BYTES:2 * _KEY_BYTES], derived[2 * _KEY_BYTES:]
-            ciphertext = _xor(plaintext, _keystream(enc_key, len(plaintext)))
-            check = hmac.new(check_key, _CHECK_LABEL, hashlib.sha256).digest()
-            tag = hmac.new(mac_key, _aad(version, salt, iterations, check) + ciphertext, hashlib.sha256).digest()
-            record = {"version": version, "scheme": SEALED_SCHEME, "iterations": iterations,
-                      "salt": base64.b64encode(salt).decode("ascii"),
-                      "material": base64.b64encode(ciphertext).decode("ascii"),
-                      "check": base64.b64encode(check).decode("ascii"),
-                      "tag": base64.b64encode(tag).decode("ascii")}
-        record["revoked"] = False
-        entry["versions"].append(record)
-        entry["active"] = version
-        self._write(document)
+        # Read, validate, assign the next version, mutate and atomically replace
+        # all inside one exclusive lock: concurrent sealers queue and observe
+        # each other's committed versions, so numbers stay gapless and unique
+        # and the final active version is the last seal to complete.
+        with _locked(self, exclusive=True):
+            document = self._read()
+            if key_id in document["keys"]:
+                entry = self._entry(document, key_id)
+            else:
+                entry = {"versions": [], "active": 0}
+                document["keys"][key_id] = entry
+            version = max((self._version_number(item, key_id) for item in entry["versions"]), default=0) + 1
+            if password is None:
+                record = {"version": version, "scheme": PLAIN_SCHEME,
+                          "material": base64.b64encode(material.encode("utf-8")).decode("ascii")}
+            else:
+                plaintext = material.encode("utf-8")
+                salt = secrets.token_bytes(_SALT_BYTES)
+                derived = _derive(password, salt, iterations, 3 * _KEY_BYTES)
+                enc_key, mac_key, check_key = derived[:_KEY_BYTES], derived[_KEY_BYTES:2 * _KEY_BYTES], derived[2 * _KEY_BYTES:]
+                ciphertext = _xor(plaintext, _keystream(enc_key, len(plaintext)))
+                check = hmac.new(check_key, _CHECK_LABEL, hashlib.sha256).digest()
+                tag = hmac.new(mac_key, _aad(version, salt, iterations, check) + ciphertext, hashlib.sha256).digest()
+                record = {"version": version, "scheme": SEALED_SCHEME, "iterations": iterations,
+                          "salt": base64.b64encode(salt).decode("ascii"),
+                          "material": base64.b64encode(ciphertext).decode("ascii"),
+                          "check": base64.b64encode(check).decode("ascii"),
+                          "tag": base64.b64encode(tag).decode("ascii")}
+            record["revoked"] = False
+            entry["versions"].append(record)
+            entry["active"] = version
+            self._write(document)
         return version
 
     def versions(self, key_id: str) -> list[int]:
         self._check_key_id(key_id)
-        document = self._read()
-        return [self._version_number(item, key_id) for item in self._entry(document, key_id)["versions"]]
+        with _locked(self, exclusive=False):
+            document = self._read()
+            return [self._version_number(item, key_id) for item in self._entry(document, key_id)["versions"]]
 
     def active(self, key_id: str) -> int:
         self._check_key_id(key_id)
-        return int(self._entry(self._read(), key_id)["active"])
+        with _locked(self, exclusive=False):
+            return int(self._entry(self._read(), key_id)["active"])
 
-    def _record(self, key_id: str, version: int | None) -> dict:
-        entry = self._entry(self._read(), key_id)
+    def _record_in(self, entry: dict, key_id: str, version: int | None) -> dict:
         wanted = entry["active"] if version is None else int(version)
         for item in entry["versions"]:
             if self._version_number(item, key_id) == wanted:
                 return item
         raise KeyError(f"unknown version {wanted} for {key_id!r}")
+
+    def _record(self, key_id: str, version: int | None) -> dict:
+        with _locked(self, exclusive=False):
+            entry = self._entry(self._read(), key_id)
+            return self._record_in(entry, key_id, version)
 
     def load(self, key_id: str, version: int | None = None, password: str | None = None) -> bytes:
         self._check_key_id(key_id)
@@ -305,21 +460,24 @@ class KeyRing:
     def set_active(self, key_id: str, version: int) -> None:
         key_id = self._check_key_id(key_id)
         version = self._check_version(version)
-        document = self._read()
-        entry = self._entry(document, key_id)
-        self._record(key_id, version)
-        entry["active"] = int(version)
-        self._write(document)
+        with _locked(self, exclusive=True):
+            document = self._read()
+            entry = self._entry(document, key_id)
+            self._record_in(entry, key_id, version)
+            entry["active"] = int(version)
+            self._write(document)
 
     def revoke(self, key_id: str, version: int) -> None:
         key_id = self._check_key_id(key_id)
         version = self._check_version(version)
-        document = self._read()
-        self._record(key_id, version)
-        for item in self._entry(document, key_id)["versions"]:
-            if item["version"] == version:
-                item["revoked"] = True
-        self._write(document)
+        with _locked(self, exclusive=True):
+            document = self._read()
+            entry = self._entry(document, key_id)
+            self._record_in(entry, key_id, version)
+            for item in entry["versions"]:
+                if item["version"] == version:
+                    item["revoked"] = True
+            self._write(document)
 
     def is_revoked(self, key_id: str, version: int) -> bool:
         self._check_key_id(key_id)
