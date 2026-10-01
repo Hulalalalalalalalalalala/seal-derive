@@ -45,16 +45,25 @@ LEGACY_DERIVE_SCHEME = "pbkdf2-sha256"
 #: New passphrase records: the original material is encrypted and authenticated,
 #: so it can be recovered by anyone who supplies the right passphrase.
 SEALED_SCHEME = "pbkdf2-sha256-sealed"
+#: Current passphrase records: identical derivation to :data:`SEALED_SCHEME`,
+#: but the authentication tag additionally binds the exact ``key_id``. A record
+#: copied or moved to another key, whose owning key was renamed, or whose
+#: version was rewritten can no longer authenticate -- only the original key
+#: name under which it was sealed opens it. The store directory is deliberately
+#: not bound, so relocating the whole directory keeps every record readable.
+SEALED_V2_SCHEME = "pbkdf2-sha256-sealed-v2"
 
 #: Schemes a stored record is allowed to name. A legacy derived-only record is
 #: structurally valid -- its parameters need not be complete -- but the value
 #: itself can never be recovered.
-_KNOWN_SCHEMES = frozenset({PLAIN_SCHEME, LEGACY_DERIVE_SCHEME, SEALED_SCHEME})
+_KNOWN_SCHEMES = frozenset(
+    {PLAIN_SCHEME, LEGACY_DERIVE_SCHEME, SEALED_SCHEME, SEALED_V2_SCHEME})
 
 _SALT_BYTES = 16
 _KEY_BYTES = 32
 _CHECK_LABEL = b"seal_derive/pbkdf2-sha256-sealed/v1/password-check"
 _TAG_LABEL = b"seal_derive/pbkdf2-sha256-sealed/v1"
+_TAG_LABEL_V2 = b"seal_derive/pbkdf2-sha256-sealed/v2"
 
 
 def _derive(password: str, salt: bytes, iterations: int, length: int = 32) -> bytes:
@@ -77,9 +86,25 @@ def _xor(left: bytes, right: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(left, right))
 
 
-def _aad(version: int, salt: bytes, iterations: int, check: bytes) -> bytes:
+def _aad(version: int, salt: bytes, iterations: int, check: bytes, key_id: str | None = None) -> bytes:
+    if key_id is None:
+        return b"|".join((
+            _TAG_LABEL,
+            str(int(version)).encode("ascii"),
+            str(int(iterations)).encode("ascii"),
+            salt,
+            check,
+        ))
+    # v2 binds the exact key name as its UTF-8 bytes. The 64-bit length prefix
+    # makes the name boundary unambiguous even when the name contains the
+    # separator byte, digits or non-ASCII text: a name copied onto another
+    # key, renamed, or represented with a different Unicode spelling can never
+    # reproduce this AAD. The store path is intentionally absent, so moving the
+    # whole directory does not invalidate records.
+    name = key_id.encode("utf-8")
     return b"|".join((
-        _TAG_LABEL,
+        _TAG_LABEL_V2,
+        len(name).to_bytes(8, "big") + name,
         str(int(version)).encode("ascii"),
         str(int(iterations)).encode("ascii"),
         salt,
@@ -437,9 +462,16 @@ class KeyRing:
                 derived = _derive(password, salt, iterations, 3 * _KEY_BYTES)
                 enc_key, mac_key, check_key = derived[:_KEY_BYTES], derived[_KEY_BYTES:2 * _KEY_BYTES], derived[2 * _KEY_BYTES:]
                 ciphertext = _xor(plaintext, _keystream(enc_key, len(plaintext)))
+                # The check label stays shared with v1: it only certifies the
+                # passphrase independently of the payload. The v2/v1 split
+                # lives entirely in the tag AAD, so rewriting the scheme field
+                # (v2->v1 downgrade or v1->v2 upgrade) fails the tag and is
+                # reported as record corruption, not as a wrong passphrase.
                 check = hmac.new(check_key, _CHECK_LABEL, hashlib.sha256).digest()
-                tag = hmac.new(mac_key, _aad(version, salt, iterations, check) + ciphertext, hashlib.sha256).digest()
-                record = {"version": version, "scheme": SEALED_SCHEME, "iterations": iterations,
+                tag = hmac.new(
+                    mac_key, _aad(version, salt, iterations, check, key_id) + ciphertext,
+                    hashlib.sha256).digest()
+                record = {"version": version, "scheme": SEALED_V2_SCHEME, "iterations": iterations,
                           "salt": base64.b64encode(salt).decode("ascii"),
                           "material": base64.b64encode(ciphertext).decode("ascii"),
                           "check": base64.b64encode(check).decode("ascii"),
@@ -504,15 +536,16 @@ class KeyRing:
             # not recoverable, even when the passphrase is supplied.
             raise UnrecoverableRecordError(
                 "不可恢复的旧记录：该版本仅保存了口令派生值，无法取回原始 material")
-        if scheme == SEALED_SCHEME:
-            return self._open_sealed(record, password)
+        if scheme in (SEALED_SCHEME, SEALED_V2_SCHEME):
+            return self._open_sealed(record, password, key_id)
         raise CorruptRecordError(f"记录损坏：未知封存方案 {scheme!r}")
 
-    def _open_sealed(self, record: dict, password: str | None) -> bytes:
+    def _open_sealed(self, record: dict, password: str | None, key_id: str) -> bytes:
         # Parse and validate every stored parameter first: truncation, missing
         # fields and malformed encodings are record corruption, even when no
         # passphrase was supplied. The version number was validated when the
         # entry was loaded.
+        scheme = record["scheme"]
         version = record["version"]
         salt = _b64_field(record, "salt", _SALT_BYTES)
         iterations = _positive_int_field(record, "iterations")
@@ -528,8 +561,15 @@ class KeyRing:
         # ciphertext, so a wrong passphrase is distinguishable from tampering.
         if not secrets.compare_digest(check, expected_check):
             raise BadPasswordError("口令不匹配：password 与封存该版本时使用的口令不一致")
-        expected_tag = hmac.new(mac_key, _aad(version, salt, iterations, check) + ciphertext,
-                                hashlib.sha256).digest()
+        # v2 tags bind the exact key_id; v1 tags keep their original AAD so
+        # legacy sealed records stay openable. A rewritten version, a record
+        # moved or copied onto another key, or a renamed owning key changes the
+        # AAD (or fails document structure first) and surfaces here as
+        # corruption, never as a wrong-passphrase error.
+        bound_key = key_id if scheme == SEALED_V2_SCHEME else None
+        expected_tag = hmac.new(
+            mac_key, _aad(version, salt, iterations, check, bound_key) + ciphertext,
+            hashlib.sha256).digest()
         if not secrets.compare_digest(tag, expected_tag):
             raise CorruptRecordError("记录损坏：密文未通过认证，记录可能被篡改或截断")
         return _xor(ciphertext, _keystream(enc_key, len(ciphertext)))
