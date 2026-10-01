@@ -414,7 +414,20 @@ class KeyRing:
     def load(self, key_id: str, version: int | None = None, password: str | None = None) -> bytes:
         self._check_key_id(key_id)
         version = self._check_version(version)
-        record = self._record(key_id, version)
+        # One shared-lock snapshot for the whole read: resolving the active
+        # version (when none is named), locating the record, checking the
+        # revoked flag and decrypting all see the same committed document. A
+        # revoke/set-active either completed before this snapshot (its result
+        # is visible end to end) or runs after it (this load keeps the old,
+        # still-consistent result); writers exclude each other and publish with
+        # an atomic rename, so a reader can never observe half of a change or a
+        # torn file.
+        with _locked(self, exclusive=False):
+            entry = self._entry(self._read(), key_id)
+            record = self._record_in(entry, key_id, version)
+            return self._open_record(record, key_id, version, password)
+
+    def _open_record(self, record: dict, key_id: str, version: int | None, password: str | None) -> bytes:
         if not isinstance(record, dict) or "scheme" not in record:
             raise CorruptRecordError("记录损坏：缺少封存方案")
         if record.get("revoked"):
