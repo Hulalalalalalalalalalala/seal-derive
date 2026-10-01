@@ -82,6 +82,11 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except TimeoutError as error:
+        # Lock wait exceeded the timeout: a storage-level failure, not a
+        # usage mistake. Must precede ``except OSError`` (its superclass).
+        print(f"error: {error}", file=sys.stderr)
+        return 1
     except json.JSONDecodeError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

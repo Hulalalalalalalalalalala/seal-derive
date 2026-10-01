@@ -35,10 +35,16 @@ python3 -m seal_derive --root ./state init
 - 非法输入抛出 `ValueError`，未知标识抛出 `KeyError`。
 - 退出码：0 成功，1 存储或校验错误，2 用法错误。
 
+## 并发
+
+- `init`、`seal`、`set_active`、`revoke` 共用同一把跨进程写锁（锁文件 `<root>/.keyring.lock`），读取、校验、变更与原子替换都在锁内完成；并发 `seal` 得到连续且不重复的版本号。
+- 等待写锁超过 5 秒抛出 `TimeoutError`（文本“获取密钥环写锁超时”）；CLI 打印 `error: 获取密钥环写锁超时` 并以退出码 1 结束。
+- 持有锁的进程被杀死或崩溃后，锁由操作系统自动回收，后续调用可在 5 秒内继续；锁文件本身永不删除或改写，`keyring.json` 不受影响。
+- 读操作（`load`、`versions`、`active`、`is_revoked`）不加锁：写入经临时文件原子替换，读到的始终是完整文档。
+
 ## 限制
 
 - 未实现密钥材料的内存清零与常时比较。
-- 未实现多进程并发写保护。
 - 派生参数只支持 PBKDF2-HMAC-SHA256。
 
 ## 语料
