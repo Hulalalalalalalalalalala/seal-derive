@@ -14,7 +14,7 @@
 python3 -m seal_derive --root ./state init
 ```
 
-子命令：`init`、`seal <key_id> <material> [--password P] [--iterations N]`、`load <key_id> [--version V]`、`versions <key_id>`、`active <key_id>`、`set-active <key_id> <version>`、`revoke <key_id> <version>`、`report`。
+子命令：`init`、`seal <key_id> <material> [--password P] [--iterations N]`、`load <key_id> [--version V]`、`versions <key_id>`、`active <key_id>`、`set-active <key_id> <version>`、`revoke <key_id> <version>`、`rotate-password <key_id> --new-password P [--password P] [--version V] [--iterations N] [--revoke-source]`、`report`。
 
 ## 公开接口
 
@@ -29,12 +29,13 @@ python3 -m seal_derive --root ./state init
 - `active(key_id) -> int` 当前活动版本。
 - `set_active(key_id, version) -> None` 把活动版本指向已有历史版本。
 - `revoke(key_id, version) -> None` 标记某版本作废。
+- `rotate_password(key_id, new_password, password=None, version=None, iterations=200_000, revoke_source=False) -> int` 用新口令重新封存指定版本（`version` 缺省取 active），返回新版本号。恢复出的 material 字节保持不变：plain 记录忽略旧口令，v1/v2 记录按 `load` 的顺序与规则认证旧口令（未知标识 `KeyError`、来源已吊销 `RevokedVersionError`、旧派生记录 `UnrecoverableRecordError`、缺少/错误旧口令 `MissingPasswordError`/`BadPasswordError`、结构损坏或正确口令下认证失败 `CorruptRecordError`），再以新盐和指定迭代次数写成绑定键名与新版本号的 `pbkdf2-sha256-sealed-v2` 记录。新版本号为历史最大号加一，未吊销并设为 active；`revoke_source=True` 时同时吊销来源版本，其余记录不变。整个操作在一把写锁内完成：版本解析、旧记录认证、新增版本、active 切换与（可选的）来源吊销原子生效，并发读写与一次串行操作等价，成功提交的版本号连续且唯一；任何校验/认证失败或等待锁超时都不修改 `keyring.json`。支持空或 Unicode 材料、空口令及新旧口令相同。参数校验先于存储访问：口令参数限字符串（旧口令可为 `None`），`iterations` 为非布尔正整数，`revoke_source` 为布尔值，否则 `ValueError`。
 - `is_revoked(key_id, version) -> bool` 查询作废状态。
 
 ## 约定
 
 - 所有写操作立即持久化；进程被杀死后 `recover`/`init` 之外的重开不得丢失已确认的写。
-- 所有修改（`init`/`seal`/`set_active`/`revoke`）共用同一把跨进程写锁（目录内 `.keyring.lock`，标准库 `flock`/`msvcrt`，无第三方依赖），在锁内完成读取、校验、变更与 `keyring.json` 的原子替换；读操作取共享锁，配合临时文件 + `os.replace` 不会读到半份文件。任何入口读到被篡改、截断或结构非法的状态都在返回/提交前抛 `CorruptRecordError`，写操作不会留下部分修改。
+- 所有修改（`init`/`seal`/`rotate_password`/`set_active`/`revoke`）共用同一把跨进程写锁（目录内 `.keyring.lock`，标准库 `flock`/`msvcrt`，无第三方依赖），在锁内完成读取、校验、变更与 `keyring.json` 的原子替换；读操作取共享锁，配合临时文件 + `os.replace` 不会读到半份文件。任何入口读到被篡改、截断或结构非法的状态都在返回/提交前抛 `CorruptRecordError`，写操作不会留下部分修改。
 - 等待写锁超过 5 秒抛 `TimeoutError`（文本“获取密钥环写锁超时”，CLI 退出码 1）；持锁进程被强制结束或崩溃后锁由内核自动释放，后续调用在等待窗口内自动接管，不删除或改写 `keyring.json`。
 - 非法输入抛出 `ValueError`，未知标识抛出 `KeyError`，缺少 `keyring.json` 抛出 `FileNotFoundError`；这三类之外的存储/校验异常（`CorruptRecordError`、`MissingPasswordError`、`BadPasswordError`、`UnrecoverableRecordError`、`TimeoutError`、`OSError`）CLI 退出码均为 1。
 - 退出码：0 成功，1 存储或校验错误，2 用法错误（含未知 key/版本与已吊销版本的 `load`）。

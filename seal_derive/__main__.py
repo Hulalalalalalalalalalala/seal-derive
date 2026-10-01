@@ -54,6 +54,13 @@ def _parser() -> argparse.ArgumentParser:
     seal.add_argument("key_id"); seal.add_argument("material"); seal.add_argument("--password"); seal.add_argument("--iterations", type=int, default=200_000)
     for verb in ("set-active", "revoke"):
         node = sub.add_parser(verb); node.add_argument("key_id"); node.add_argument("version", type=int)
+    rotate = sub.add_parser("rotate-password", help="re-seal a version under a new passphrase")
+    rotate.add_argument("key_id")
+    rotate.add_argument("--new-password", required=True)
+    rotate.add_argument("--password")
+    rotate.add_argument("--version", type=int)
+    rotate.add_argument("--iterations", type=int, default=200_000)
+    rotate.add_argument("--revoke-source", action="store_true")
     sub.add_parser("report", help="print this domain's report as JSON")
     return parser
 
@@ -76,6 +83,10 @@ def main(argv: list[str] | None = None) -> int:
             ring.set_active(args.key_id, args.version); print("ok")
         elif args.command == "revoke":
             ring.revoke(args.key_id, args.version); print("ok")
+        elif args.command == "rotate-password":
+            print(ring.rotate_password(
+                args.key_id, args.new_password, args.password,
+                args.version, args.iterations, args.revoke_source))
         elif args.command == "report":
             print(_report(["keyring", "derive"], {"seal": True, "rotate": True, "revoke": True, "constantTime": False}))
         return 0
