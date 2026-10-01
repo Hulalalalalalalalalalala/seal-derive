@@ -14,7 +14,7 @@
 python3 -m seal_derive --root ./state init
 ```
 
-子命令：`init`、`seal <key_id> <material> [--password P] [--iterations N]`、`load <key_id> [--version V]`、`versions <key_id>`、`active <key_id>`、`set-active <key_id> <version>`、`revoke <key_id> <version>`、`report`。
+子命令：`init`、`seal <key_id> <material> [--password P] [--iterations N]`、`rotate-password <key_id> --new-password P [--password P] [--version V] [--iterations N] [--revoke-source]`、`load <key_id> [--version V]`、`versions <key_id>`、`active <key_id>`、`set-active <key_id> <version>`、`revoke <key_id> <version>`、`report`。
 
 ## 公开接口
 
@@ -22,8 +22,9 @@ python3 -m seal_derive --root ./state init
 
 - `init() -> None` 建立空密钥环。
 - `seal(key_id, material, password=None, iterations=200_000) -> int` 封存材料并返回版本号；给出 `password` 时统一写入 `pbkdf2-sha256-sealed-v2` 记录：以 PBKDF2-HMAC-SHA256 派生密钥加密并认证原始 material，持正确口令可完整取回。v2 沿用既有派生参数与默认迭代次数，但认证 tag 的附加数据额外绑定封存时的完整 `key_id`（UTF-8 字节，带长度前缀；不含存储路径），因此记录只能在原 key_id 下通过认证：复制或移动到另一个 key_id、改名所属键、改写 version、篡改密文或 tag，`load` 一律抛含“记录损坏”的 `CorruptRecordError` 且不输出材料。键名按完整字符串区分，中文、emoji、空格与分隔符均可使用，大小写或 Unicode 表示不同的键不能相互通过认证。无口令封存仍写入 `plain`。成功后按原规则增加版本并更新 active。
+- `rotate_password(key_id, new_password, password=None, version=None, iterations=200_000, revoke_source=False) -> int` 为已有封存版本换口令并返回新版本号。`version` 缺省取当前活动版本；`plain` 来源忽略旧口令，v1/v2 来源按 `load` 的同一顺序与判定认证（未知标识 `KeyError`、已吊销来源 `RevokedVersionError`、旧派生记录 `UnrecoverableRecordError`、缺少或错误旧口令分别 `MissingPasswordError`、`BadPasswordError`、结构损坏或正确口令下认证失败 `CorruptRecordError`）。取回的原始 material 字节不变，使用新盐与指定迭代次数写成 `pbkdf2-sha256-sealed-v2` 记录，tag 绑定键名和新版本号。新版本号取历史最大号加一，未吊销并设为 active；`revoke_source=True` 时一并吊销来源版本，其余版本与键不变。输入先于存储校验：`new_password` 限字符串、旧 `password` 限字符串或 `None`、`iterations` 限非布尔正整数、`revoke_source` 限布尔，否则抛 `ValueError`。整个读取—认证—变更—提交在同一把排他写锁内原子完成；任何失败（含等待锁超时）都不修改 `keyring.json`。支持空或 Unicode 材料、空口令及新旧口令相同。CLI 成功仅输出版本号加换行；非法输入、未知标识、已吊销来源退出 2，其余错误退出 1。
 - `load(key_id, version=None, password=None) -> bytes` 取回**原始 material 的 UTF-8 bytes**（不是派生值）；`version` 缺省取当前活动版本。一次 load 的版本解析（含缺省时读 active）、吊销校验与解密在同一共享锁快照内完成：并发的 `revoke`/`set_active` 要么在 load 开始前已提交（load 见到新状态），要么等 load 结束后才能提交，已完成的 load 不被稍后的变更追溯否定。解析到已吊销版本抛 `RevokedVersionError`（消息含“已吊销”，CLI 退出码 2）。受口令版本必须传 `password`：缺少口令抛含“缺少口令”的 `ValueError`，口令错误抛含“口令不匹配”的 `ValueError`，记录被篡改、截断或参数不全抛含“记录损坏”的 `ValueError`。旧的仅保存派生值的 `pbkdf2-sha256` 记录无法恢复原 material，抛含“不可恢复的旧记录”的 `ValueError`。
-- 所有读取状态的入口（含缺省版本的 `load`、`versions`、`active`、`is_revoked`）返回前统一校验整份 `keyring.json`；写入入口（`seal`、`set_active`、`revoke`）在写锁内校验快照，再原子提交。顶层 `keys`、每个键的 `versions` 与非布尔正整数 `active`（必须指向真实版本）、版本记录的 `version`（非布尔正整数、键内唯一且按列表升序）、布尔 `revoked`、已识别 `scheme`（`plain`、`pbkdf2-sha256`、`pbkdf2-sha256-sealed`、`pbkdf2-sha256-sealed-v2`）、必要字段、Base64 与固定长度、正整数 `iterations` 均须合法；`plain` 的 Base64 内容必须是合法 UTF-8，两种 sealed 方案的 `salt`/`check`/`tag`/`material` 必须完整且口令取回时通过认证（v2 还要通过 key_id 绑定认证）。任何一项不满足，所有入口一致抛含“记录损坏”的 `CorruptRecordError`（CLI 退出码 1）；写入口遇坏状态不修改文件、不产生返回值。结构完整的旧 `pbkdf2-sha256` 记录仍只抛 `UnrecoverableRecordError`，不会误报为口令错误。
+- 所有读取状态的入口（含缺省版本的 `load`、`versions`、`active`、`is_revoked`）返回前统一校验整份 `keyring.json`；写入入口（`seal`、`rotate_password`、`set_active`、`revoke`）在写锁内校验快照，再原子提交。顶层 `keys`、每个键的 `versions` 与非布尔正整数 `active`（必须指向真实版本）、版本记录的 `version`（非布尔正整数、键内唯一且按列表升序）、布尔 `revoked`、已识别 `scheme`（`plain`、`pbkdf2-sha256`、`pbkdf2-sha256-sealed`、`pbkdf2-sha256-sealed-v2`）、必要字段、Base64 与固定长度、正整数 `iterations` 均须合法；`plain` 的 Base64 内容必须是合法 UTF-8，两种 sealed 方案的 `salt`/`check`/`tag`/`material` 必须完整且口令取回时通过认证（v2 还要通过 key_id 绑定认证）。任何一项不满足，所有入口一致抛含“记录损坏”的 `CorruptRecordError`（CLI 退出码 1）；写入口遇坏状态不修改文件、不产生返回值。结构完整的旧 `pbkdf2-sha256` 记录仍只抛 `UnrecoverableRecordError`，不会误报为口令错误。
 - 旧记录兼容：旧 `pbkdf2-sha256-sealed`（v1）记录仍可凭原口令取出，读取不追溯改写、不升级其 scheme，也不补绑 key_id（v1 记录被搬到其他键下仍按旧规则可开）；旧 `pbkdf2-sha256` 记录继续抛 `UnrecoverableRecordError`。同一键的不同版本继续按原规则读取；v2 的 tag 不绑定目录，整体搬迁存储目录不影响读取。
 - `versions(key_id) -> list[int]` 升序返回全部版本。
 - `active(key_id) -> int` 当前活动版本。
@@ -34,7 +35,7 @@ python3 -m seal_derive --root ./state init
 ## 约定
 
 - 所有写操作立即持久化；进程被杀死后 `recover`/`init` 之外的重开不得丢失已确认的写。
-- 所有修改（`init`/`seal`/`set_active`/`revoke`）共用同一把跨进程写锁（目录内 `.keyring.lock`，标准库 `flock`/`msvcrt`，无第三方依赖），在锁内完成读取、校验、变更与 `keyring.json` 的原子替换；读操作取共享锁，配合临时文件 + `os.replace` 不会读到半份文件。任何入口读到被篡改、截断或结构非法的状态都在返回/提交前抛 `CorruptRecordError`，写操作不会留下部分修改。
+- 所有修改（`init`/`seal`/`rotate_password`/`set_active`/`revoke`）共用同一把跨进程写锁（目录内 `.keyring.lock`，标准库 `flock`/`msvcrt`，无第三方依赖），在锁内完成读取、校验、变更与 `keyring.json` 的原子替换；读操作取共享锁，配合临时文件 + `os.replace` 不会读到半份文件。任何入口读到被篡改、截断或结构非法的状态都在返回/提交前抛 `CorruptRecordError`，写操作不会留下部分修改。
 - 等待写锁超过 5 秒抛 `TimeoutError`（文本“获取密钥环写锁超时”，CLI 退出码 1）；持锁进程被强制结束或崩溃后锁由内核自动释放，后续调用在等待窗口内自动接管，不删除或改写 `keyring.json`。
 - 非法输入抛出 `ValueError`，未知标识抛出 `KeyError`，缺少 `keyring.json` 抛出 `FileNotFoundError`；这三类之外的存储/校验异常（`CorruptRecordError`、`MissingPasswordError`、`BadPasswordError`、`UnrecoverableRecordError`、`TimeoutError`、`OSError`）CLI 退出码均为 1。
 - 退出码：0 成功，1 存储或校验错误，2 用法错误（含未知 key/版本与已吊销版本的 `load`）。

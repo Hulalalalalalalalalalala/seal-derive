@@ -437,6 +437,34 @@ class KeyRing:
             raise CorruptRecordError(f"记录损坏：{key_id!r} 的版本号非法")
         return value
 
+    @staticmethod
+    def _sealed_v2_record(version: int, key_id: str, plaintext: bytes,
+                          password: str, iterations: int) -> dict:
+        """Build a v2 sealed record for ``plaintext`` under ``password``.
+
+        Shared by ``seal`` and ``rotate_password`` so a password rotation
+        rewrites the same material bytes with a fresh salt, the requested
+        iteration count, and the key name/version bound into the tag.
+        """
+        salt = secrets.token_bytes(_SALT_BYTES)
+        derived = _derive(password, salt, iterations, 3 * _KEY_BYTES)
+        enc_key, mac_key, check_key = derived[:_KEY_BYTES], derived[_KEY_BYTES:2 * _KEY_BYTES], derived[2 * _KEY_BYTES:]
+        ciphertext = _xor(plaintext, _keystream(enc_key, len(plaintext)))
+        # The check label stays shared with v1: it only certifies the
+        # passphrase independently of the payload. The v2/v1 split
+        # lives entirely in the tag AAD, so rewriting the scheme field
+        # (v2->v1 downgrade or v1->v2 upgrade) fails the tag and is
+        # reported as record corruption, not as a wrong passphrase.
+        check = hmac.new(check_key, _CHECK_LABEL, hashlib.sha256).digest()
+        tag = hmac.new(
+            mac_key, _aad(version, salt, iterations, check, key_id) + ciphertext,
+            hashlib.sha256).digest()
+        return {"version": version, "scheme": SEALED_V2_SCHEME, "iterations": iterations,
+                "salt": base64.b64encode(salt).decode("ascii"),
+                "material": base64.b64encode(ciphertext).decode("ascii"),
+                "check": base64.b64encode(check).decode("ascii"),
+                "tag": base64.b64encode(tag).decode("ascii")}
+
     def seal(self, key_id: str, material: str, password: str | None = None, iterations: int = 200_000) -> int:
         key_id = self._check_key_id(key_id)
         if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
@@ -457,30 +485,51 @@ class KeyRing:
                 record = {"version": version, "scheme": PLAIN_SCHEME,
                           "material": base64.b64encode(material.encode("utf-8")).decode("ascii")}
             else:
-                plaintext = material.encode("utf-8")
-                salt = secrets.token_bytes(_SALT_BYTES)
-                derived = _derive(password, salt, iterations, 3 * _KEY_BYTES)
-                enc_key, mac_key, check_key = derived[:_KEY_BYTES], derived[_KEY_BYTES:2 * _KEY_BYTES], derived[2 * _KEY_BYTES:]
-                ciphertext = _xor(plaintext, _keystream(enc_key, len(plaintext)))
-                # The check label stays shared with v1: it only certifies the
-                # passphrase independently of the payload. The v2/v1 split
-                # lives entirely in the tag AAD, so rewriting the scheme field
-                # (v2->v1 downgrade or v1->v2 upgrade) fails the tag and is
-                # reported as record corruption, not as a wrong passphrase.
-                check = hmac.new(check_key, _CHECK_LABEL, hashlib.sha256).digest()
-                tag = hmac.new(
-                    mac_key, _aad(version, salt, iterations, check, key_id) + ciphertext,
-                    hashlib.sha256).digest()
-                record = {"version": version, "scheme": SEALED_V2_SCHEME, "iterations": iterations,
-                          "salt": base64.b64encode(salt).decode("ascii"),
-                          "material": base64.b64encode(ciphertext).decode("ascii"),
-                          "check": base64.b64encode(check).decode("ascii"),
-                          "tag": base64.b64encode(tag).decode("ascii")}
+                record = self._sealed_v2_record(
+                    version, key_id, material.encode("utf-8"), password, iterations)
             record["revoked"] = False
             entry["versions"].append(record)
             entry["active"] = version
             self._write(document)
         return version
+
+    def rotate_password(self, key_id: str, new_password: str, password: str | None = None,
+                        version: int | None = None, iterations: int = 200_000,
+                        revoke_source: bool = False) -> int:
+        key_id = self._check_key_id(key_id)
+        if not isinstance(new_password, str):
+            raise ValueError("new_password must be a string")
+        if password is not None and not isinstance(password, str):
+            raise ValueError("password must be a string or None")
+        version = self._check_version(version)
+        if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
+            raise ValueError("iterations must be positive")
+        if not isinstance(revoke_source, bool):
+            raise ValueError("revoke_source must be a boolean")
+        # Everything happens inside one exclusive lock: authenticate against
+        # the committed snapshot (load's order and verdicts), then append the
+        # re-sealed version, repoint active and optionally revoke the source
+        # before a single atomic replace. No failure path mutates the file.
+        with _locked(self, exclusive=True):
+            document = self._read()
+            entry = self._entry(document, key_id)
+            source = self._record_in(entry, key_id, version)
+            # Recover the original material with load's exact checks: plain
+            # ignores the old password; v1/v2 authenticate it. Every failure
+            # type and wording therefore matches load, and the revoked check
+            # happens against the snapshot we are about to mutate.
+            plaintext = self._material_from(source, key_id, password)
+            new_version = max(
+                (self._version_number(item, key_id) for item in entry["versions"]), default=0) + 1
+            record = self._sealed_v2_record(
+                new_version, key_id, plaintext, new_password, iterations)
+            record["revoked"] = False
+            entry["versions"].append(record)
+            entry["active"] = new_version
+            if revoke_source:
+                source["revoked"] = True
+            self._write(document)
+        return new_version
 
     def versions(self, key_id: str) -> list[int]:
         self._check_key_id(key_id)
