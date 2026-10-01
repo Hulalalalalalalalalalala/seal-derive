@@ -35,6 +35,7 @@ python3 -m seal_derive --root ./state init
 - 所有修改（`init`/`seal`/`set_active`/`revoke`）共用同一把跨进程写锁（目录内 `.keyring.lock`，标准库 `flock`/`msvcrt`，无第三方依赖），在锁内完成读取、校验、变更与 `keyring.json` 的原子替换；读操作取共享锁，配合临时文件 + `os.replace` 不会读到半份文件。
 - 等待写锁超过 5 秒抛 `TimeoutError`（文本“获取密钥环写锁超时”，CLI 退出码 1）；持锁进程被强制结束或崩溃后锁由内核自动释放，后续调用在等待窗口内自动接管，不删除或改写 `keyring.json`。
 - 非法输入抛出 `ValueError`，未知标识抛出 `KeyError`。
+- 每个入口在返回或提交前都会完整校验 `keyring.json` 的已提交状态：顶层 `keys`/版本历史结构、`active` 为非布尔正整数且指向真实版本、版本号唯一且升序、`revoked` 为布尔、`scheme` 已识别、必要字段完整且 Base64/固定长度/iterations/明文 UTF-8 合法。被篡改、截断或结构非法的状态在所有入口统一抛含“记录损坏”的 `CorruptRecordError`（CLI 退出码 1）；写入入口在锁内校验失败时不产生任何修改或输出。口令封存记录的认证（check/tag）仍在 `load` 提供口令时核验。
 - 退出码：0 成功，1 存储或校验错误，2 用法错误。
 
 ## 限制

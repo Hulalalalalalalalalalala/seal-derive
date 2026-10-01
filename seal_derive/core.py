@@ -270,6 +270,11 @@ class KeyRing:
             raise CorruptRecordError("记录损坏：密钥环文件被截断或无法解析") from error
         if not isinstance(document, dict) or not isinstance(document.get("keys"), dict):
             raise CorruptRecordError("记录损坏：密钥环结构非法")
+        # Every entry point -- metadata queries, loads and writes alike --
+        # validates the whole committed document before acting on it, so a
+        # tampered, truncated or structurally illegal keyring.json is rejected
+        # uniformly instead of surfacing different errors per record touched.
+        self._validate_document(document)
         return document
 
     def _write(self, document: dict) -> None:
@@ -328,19 +333,65 @@ class KeyRing:
         return version
 
     def _entry(self, document: dict, key_id: str) -> dict:
+        # ``document`` comes from ``_read`` and is therefore already fully
+        # validated; this is only the unknown-key lookup.
         if key_id not in document["keys"]:
             raise KeyError(f"unknown key {key_id!r}")
-        entry = document["keys"][key_id]
-        if not isinstance(entry, dict) or not isinstance(entry.get("versions"), list) \
-                or not isinstance(entry.get("active"), int):
+        return document["keys"][key_id]
+
+    def _validate_document(self, document: dict) -> None:
+        for key_id, entry in document["keys"].items():
+            self._validate_entry(key_id, entry)
+
+    def _validate_entry(self, key_id: str, entry) -> None:
+        if not isinstance(entry, dict) or not isinstance(entry.get("versions"), list):
             raise CorruptRecordError(f"记录损坏：{key_id!r} 的版本历史结构非法")
+        active = entry.get("active")
+        if isinstance(active, bool) or not isinstance(active, int) or active <= 0:
+            raise CorruptRecordError(f"记录损坏：{key_id!r} 的活动版本缺失或非法")
+        numbers: list[int] = []
+        previous = 0
         for item in entry["versions"]:
             if not isinstance(item, dict):
                 raise CorruptRecordError(f"记录损坏：{key_id!r} 含非法版本记录")
-            self._version_number(item, key_id)
-            if "revoked" in item and not isinstance(item["revoked"], bool):
-                raise CorruptRecordError(f"记录损坏：{key_id!r} 的吊销标记非法")
-        return entry
+            number = self._version_number(item, key_id)
+            if number <= previous:
+                raise CorruptRecordError(f"记录损坏：{key_id!r} 的版本号重复或未按升序排列")
+            previous = number
+            numbers.append(number)
+            if not isinstance(item.get("revoked"), bool):
+                raise CorruptRecordError(f"记录损坏：{key_id!r} 的吊销标记缺失或非法")
+            self._validate_record(item, key_id)
+        if active not in numbers:
+            raise CorruptRecordError(f"记录损坏：{key_id!r} 的活动版本指向不存在的版本")
+
+    def _validate_record(self, record: dict, key_id: str) -> None:
+        """Structural checks that need no passphrase.
+
+        Authentication of a sealed record still happens at open time in
+        ``_open_sealed``: the tag cannot be verified without the passphrase.
+        """
+        scheme = record.get("scheme")
+        if scheme == LEGACY_DERIVE_SCHEME:
+            # Derived-only records carry no recoverable material: nothing
+            # further to validate, and nothing a passphrase could open.
+            return
+        if scheme == PLAIN_SCHEME:
+            material = _b64_field(record, "material")
+            try:
+                material.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise CorruptRecordError(
+                    f"记录损坏：{key_id!r} 的明文记录不是合法 UTF-8") from error
+            return
+        if scheme == SEALED_SCHEME:
+            _positive_int_field(record, "iterations")
+            _b64_field(record, "salt", _SALT_BYTES)
+            _b64_field(record, "material")
+            _b64_field(record, "check", _KEY_BYTES)
+            _b64_field(record, "tag", _KEY_BYTES)
+            return
+        raise CorruptRecordError(f"记录损坏：{key_id!r} 含未知封存方案 {scheme!r}")
 
     def _version_number(self, item: dict, key_id: str) -> int:
         value = item.get("version")
