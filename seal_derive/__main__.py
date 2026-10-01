@@ -82,6 +82,12 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except json.JSONDecodeError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
     except (KeyError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return USAGE_ERROR

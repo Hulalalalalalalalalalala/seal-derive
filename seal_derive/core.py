@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import secrets
+import tempfile
 from pathlib import Path
 
 __all__ = ["KeyRing"]
@@ -35,7 +37,36 @@ class KeyRing:
 
     def _write(self, document: dict) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(document, sort_keys=True, indent=2), encoding="utf-8")
+        if self.path.exists() and not os.access(self.path, os.W_OK):
+            raise PermissionError(f"key ring file is not writable: {self.path}")
+        payload = json.dumps(document, sort_keys=True, indent=2)
+        # Write to a sibling temp file, fsync it, then atomically replace
+        # keyring.json: a crash leaves either the old or the new document.
+        handle, temporary = tempfile.mkstemp(dir=self.directory, prefix=".keyring-", suffix=".tmp")
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+        self._fsync_directory()
+
+    def _fsync_directory(self) -> None:
+        # Persist the rename itself. Windows cannot fsync directories, but
+        # os.replace is already atomic there, so this is a no-op off POSIX.
+        if not hasattr(os, "O_DIRECTORY"):
+            return
+        descriptor = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _entry(self, document: dict, key_id: str) -> dict:
         if key_id not in document["keys"]:
