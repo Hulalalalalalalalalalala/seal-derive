@@ -46,6 +46,11 @@ LEGACY_DERIVE_SCHEME = "pbkdf2-sha256"
 #: so it can be recovered by anyone who supplies the right passphrase.
 SEALED_SCHEME = "pbkdf2-sha256-sealed"
 
+#: Schemes a stored record is allowed to name. A legacy derived-only record is
+#: structurally valid -- its parameters need not be complete -- but the value
+#: itself can never be recovered.
+_KNOWN_SCHEMES = frozenset({PLAIN_SCHEME, LEGACY_DERIVE_SCHEME, SEALED_SCHEME})
+
 _SALT_BYTES = 16
 _KEY_BYTES = 32
 _CHECK_LABEL = b"seal_derive/pbkdf2-sha256-sealed/v1/password-check"
@@ -265,14 +270,79 @@ class KeyRing:
         if not self.path.is_file():
             raise FileNotFoundError(f"no key ring at {self.path}; run init first")
         try:
-            document = json.loads(self.path.read_text(encoding="utf-8"))
+            text = self.path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise CorruptRecordError("记录损坏：密钥环文件被截断或无法解析") from error
+        try:
+            document = json.loads(text)
         except json.JSONDecodeError as error:
             raise CorruptRecordError("记录损坏：密钥环文件被截断或无法解析") from error
-        if not isinstance(document, dict) or not isinstance(document.get("keys"), dict):
-            raise CorruptRecordError("记录损坏：密钥环结构非法")
+        # Every entry point gets the same verdict: the whole document is either
+        # structurally sound or rejected as one corrupt record.
+        self._validate_document(document)
         return document
 
+    def _validate_document(self, document: object) -> None:
+        if not isinstance(document, dict) or not isinstance(document.get("keys"), dict):
+            raise CorruptRecordError("记录损坏：密钥环结构非法")
+        for key_id, entry in document["keys"].items():
+            self._validate_entry(key_id, entry)
+
+    def _validate_entry(self, key_id: str, entry: object) -> None:
+        if not isinstance(entry, dict) or not isinstance(entry.get("versions"), list):
+            raise CorruptRecordError(f"记录损坏：{key_id!r} 的版本历史结构非法")
+        active = entry.get("active")
+        # bool is a subtype of int: an explicit bool is never a valid pointer.
+        if isinstance(active, bool) or not isinstance(active, int) or active <= 0:
+            raise CorruptRecordError(f"记录损坏：{key_id!r} 的活动版本缺失或非法")
+        numbers: list[int] = []
+        seen: set[int] = set()
+        for item in entry["versions"]:
+            if not isinstance(item, dict):
+                raise CorruptRecordError(f"记录损坏：{key_id!r} 含非法版本记录")
+            number = self._version_number(item, key_id)
+            if number in seen:
+                raise CorruptRecordError(f"记录损坏：{key_id!r} 的版本号重复")
+            seen.add(number)
+            numbers.append(number)
+            if not isinstance(item.get("revoked"), bool):
+                raise CorruptRecordError(f"记录损坏：{key_id!r} 的吊销标记非法")
+            self._validate_record_scheme(item, key_id)
+        if numbers != sorted(numbers):
+            raise CorruptRecordError(f"记录损坏：{key_id!r} 的版本历史未按版本号升序")
+        if active not in seen:
+            raise CorruptRecordError(f"记录损坏：{key_id!r} 的活动版本未指向真实版本")
+
+    def _validate_record_scheme(self, item: dict, key_id: str) -> None:
+        scheme = item.get("scheme")
+        if not isinstance(scheme, str) or scheme not in _KNOWN_SCHEMES:
+            raise CorruptRecordError(f"记录损坏：{key_id!r} 的封存方案缺失或未识别")
+        if scheme == LEGACY_DERIVE_SCHEME:
+            # Structurally a valid record; only the derived value was stored, so
+            # load() still reports it as unrecoverable rather than corrupt.
+            return
+        if scheme == PLAIN_SCHEME:
+            raw = _b64_field(item, "material")
+            try:
+                raw.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise CorruptRecordError(
+                    f"记录损坏：{key_id!r} 的 material 不是合法 UTF-8") from error
+            return
+        # Sealed records: every parameter must be present with a legal encoding
+        # and fixed length. The passphrase-bound check/tag are authenticated at
+        # load time, when the passphrase is available.
+        _b64_field(item, "salt", _SALT_BYTES)
+        _positive_int_field(item, "iterations")
+        _b64_field(item, "material")
+        _b64_field(item, "check", _KEY_BYTES)
+        _b64_field(item, "tag", _KEY_BYTES)
+
     def _write(self, document: dict) -> None:
+        # Never persist a structurally invalid document, even one assembled in
+        # process; callers validated the snapshot they mutated, this validates
+        # the document they are about to atomically commit.
+        self._validate_document(document)
         self.directory.mkdir(parents=True, exist_ok=True)
         if self.path.exists() and not os.access(self.path, os.W_OK):
             raise PermissionError(f"key ring file is not writable: {self.path}")
@@ -328,19 +398,11 @@ class KeyRing:
         return version
 
     def _entry(self, document: dict, key_id: str) -> dict:
+        # The whole document (this entry included) was validated by _read()
+        # under the same lock snapshot; here we only resolve the key.
         if key_id not in document["keys"]:
             raise KeyError(f"unknown key {key_id!r}")
-        entry = document["keys"][key_id]
-        if not isinstance(entry, dict) or not isinstance(entry.get("versions"), list) \
-                or not isinstance(entry.get("active"), int):
-            raise CorruptRecordError(f"记录损坏：{key_id!r} 的版本历史结构非法")
-        for item in entry["versions"]:
-            if not isinstance(item, dict):
-                raise CorruptRecordError(f"记录损坏：{key_id!r} 含非法版本记录")
-            self._version_number(item, key_id)
-            if "revoked" in item and not isinstance(item["revoked"], bool):
-                raise CorruptRecordError(f"记录损坏：{key_id!r} 的吊销标记非法")
-        return entry
+        return document["keys"][key_id]
 
     def _version_number(self, item: dict, key_id: str) -> int:
         value = item.get("version")
