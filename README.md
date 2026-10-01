@@ -31,8 +31,8 @@ python3 -m seal_derive --root ./state init
 
 ## 约定
 
-- 所有写操作立即持久化；进程被杀死后 `recover`/`init` 之外的重开不得丢失已确认的写。
-- 非法输入抛出 `ValueError`，未知标识抛出 `KeyError`。
+- 所有写操作崩溃一致：要么完整保留操作前状态，要么完整落盘操作后状态；方法成功返回后重开同一 `root` 即可读到同一结果，不会出现半份 JSON。
+- 非法输入抛出 `ValueError`，未知标识抛出 `KeyError`；环文件缺失抛 `FileNotFoundError`，内容不是合法 JSON 时抛 `json.JSONDecodeError`。
 - 退出码：0 成功，1 存储或校验错误，2 用法错误。
 
 ## 限制

@@ -5,16 +5,40 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import secrets
+import stat
 from pathlib import Path
 
 __all__ = ["KeyRing"]
 
 RING_FILE = "keyring.json"
 
+#: Scratch file staged next to the ring file; never read back as ring state.
+TEMP_FILE = f".{RING_FILE}.tmp"
+
 
 def _derive(password: str, salt: bytes, iterations: int, length: int = 32) -> bytes:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=length)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a rename/replace in *directory* durable; a no-op on Windows.
+
+    Windows has no fsync for directory handles; ``os.replace`` there is already
+    an atomic replace (MoveFileExW), so durability of the swap needs no extra
+    step. On POSIX the directory entry change must be synced separately.
+    """
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    fd = os.open(directory, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 class KeyRing:
@@ -34,8 +58,49 @@ class KeyRing:
         return json.loads(self.path.read_text(encoding="utf-8"))
 
     def _write(self, document: dict) -> None:
+        """Crash-consistent replace of the ring file.
+
+        The full document is written to a scratch file in the same directory,
+        flushed and synced, then swapped in with ``os.replace`` (an atomic
+        replace on both POSIX and Windows) followed by a directory fsync on
+        POSIX. A process killed at any point therefore leaves either the
+        previous or the new complete document at :attr:`path`; the scratch
+        file is never read as ring state and is unlinked on failure.
+        """
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(document, sort_keys=True, indent=2), encoding="utf-8")
+        # os.replace on POSIX would succeed over a read-only target; keep the
+        # baseline behaviour of writing through keyring.json and failing with
+        # OSError when that file is not writable.
+        previous_mode = None
+        if self.path.exists():
+            previous_mode = stat.S_IMODE(self.path.stat().st_mode)
+            if not os.access(self.path, os.W_OK):
+                raise PermissionError(f"key ring file is not writable: {self.path}")
+        payload = json.dumps(document, sort_keys=True, indent=2)
+        temp = self.directory / TEMP_FILE
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+        try:
+            # fdopen owns fd: the scratch file is fully closed before the
+            # replace, which matters for Windows' sharing rules.
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Truncating in place (the old write path) preserved the file's
+            # mode; carry it onto the replacement before the atomic swap.
+            if previous_mode is not None:
+                os.chmod(temp, previous_mode)
+            os.replace(temp, self.path)
+        except BaseException:
+            try:
+                os.unlink(temp)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            raise
+        else:
+            _fsync_directory(self.directory)
 
     def _entry(self, document: dict, key_id: str) -> dict:
         if key_id not in document["keys"]:
