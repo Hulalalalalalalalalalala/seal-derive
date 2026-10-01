@@ -10,7 +10,7 @@ import json
 import sys
 
 from . import DOMAIN, SOURCE_CATEGORIES, __version__
-from .core import KeyRing
+from .core import KeyRing, SealError
 
 USAGE_ERROR = 2
 
@@ -86,6 +86,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 1
     except OSError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except SealError as error:
+        # Missing/mismatched passphrase, tampering, and legacy derived-only
+        # records are verification failures, not usage mistakes.
         print(f"error: {error}", file=sys.stderr)
         return 1
     except (KeyError, ValueError) as error:
