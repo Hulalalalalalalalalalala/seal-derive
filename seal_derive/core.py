@@ -66,6 +66,13 @@ _CHECK_LABEL = b"seal_derive/pbkdf2-sha256-sealed/v1/password-check"
 _TAG_LABEL = b"seal_derive/pbkdf2-sha256-sealed/v1"
 _TAG_LABEL_V2 = b"seal_derive/pbkdf2-sha256-sealed/v2"
 
+#: Fields a sealed record owns itself. When ``rename_key`` re-seals a history
+#: entry as v2 these are the values it replaces; any further key on the stored
+#: record is an extension field and is carried onto the rebuilt record.
+_STANDARD_RECORD_FIELDS = frozenset(
+    {"version", "scheme", "iterations", "salt", "material",
+     "check", "tag", "revoked"})
+
 
 def _derive(password: str, salt: bytes, iterations: int, length: int = 32) -> bytes:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=length)
@@ -1106,6 +1113,157 @@ class KeyRing:
             self._write(document)
         return new_versions
 
+    @staticmethod
+    def _check_rename_passwords(passwords: dict) -> dict[int, str]:
+        """Validate and copy a ``rename_key`` password map before storage access.
+
+        Keys name historical versions: each must be a non-bool positive
+        integer. Values are passphrases and must be strings (the empty string
+        is a legal passphrase). A plain version needs no entry, and an entry
+        for a plain version is simply ignored later. The caller's mapping is
+        only read and copied, never mutated.
+        """
+        if not isinstance(passwords, dict):
+            raise ValueError("passwords must be a dict or None")
+        normalised: dict[int, str] = {}
+        for number, password in passwords.items():
+            if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+                raise ValueError("passwords keys must be positive integer versions")
+            if not isinstance(password, str):
+                raise ValueError("passwords values must be strings")
+            normalised[number] = password
+        return normalised
+
+    def rename_key(self, source: str, target: str,
+                   passwords: dict[int, str] | None = None,
+                   expected_active: int | None = None) -> None:
+        """Atomically rename a key, moving its complete history to a new name.
+
+        ``source`` and ``target`` must be two different non-empty strings.
+        ``passwords`` is ``None`` (or omitted) or a dict keyed by non-bool
+        positive integer version numbers with string passphrases as values;
+        ``expected_active`` is ``None``/omitted (no check) or a non-bool
+        positive integer the source key's current active version must equal.
+        Bad names, equal names, an ill-shaped password map or an illegal
+        precondition all raise ``ValueError`` before any storage is touched,
+        and the caller's mapping is never mutated.
+
+        Inside one exclusive lock the whole store is structurally validated
+        first, then the checks run in this exact order: the source key exists
+        (``KeyError``), the active precondition matches
+        (:class:`ActiveVersionConflictError`), the target does not yet exist
+        (``ValueError`` whose message contains "目标键已存在") and every
+        version named in ``passwords`` exists in the source history
+        (``KeyError``). The history is then walked in ascending version order:
+        a ``plain`` record is carried over unchanged and its password (if any)
+        ignored; a legacy derived-only record raises
+        :class:`UnrecoverableRecordError`; v1/v2 records authenticate with
+        ``load``'s exact verdicts -- a missing entry is
+        :class:`MissingPasswordError`, a wrong passphrase
+        :class:`BadPasswordError`, and structural damage or failed
+        authentication under the right passphrase
+        :class:`CorruptRecordError`. Revoked records authenticate just the
+        same: they are neither skipped nor rejected, and stay revoked. The
+        first failure aborts before anything is rebuilt, leaving
+        ``keyring.json`` byte-for-byte unchanged.
+
+        On success the source key is gone and the target keeps the original
+        version numbers, order, active pointer, revocation marks and material
+        bytes. Every sealed historical version is rewritten as v2 with the
+        original passphrase and iteration count and a fresh salt per version,
+        its tag now bound to ``target``; plain records move byte-for-byte,
+        revocation marks are preserved, and any extension fields on the
+        document, the entry or an individual record travel across untouched.
+        Other keys are untouched. Nothing is returned; a revoked version still
+        fails ``load``, and a later :meth:`seal` numbers from the history
+        maximum plus one. Concurrent callers observe only the state entirely
+        before or entirely after the rename. A missing store raises
+        ``FileNotFoundError``, waiting over five seconds for the write lock
+        raises ``TimeoutError``, and other storage failures propagate as
+        ``OSError`` with no partial rename on disk.
+        """
+        source = self._check_key_id(source)
+        target = self._check_key_id(target)
+        if source == target:
+            raise ValueError("source and target must be different key names")
+        normalised = {} if passwords is None else self._check_rename_passwords(passwords)
+        expected_active = self._check_expected_active(expected_active)
+        # Read, validate, check, authenticate, rebuild and atomically replace
+        # all inside one exclusive lock, mirroring every other mutation: a
+        # concurrent rename/seal either committed before this snapshot (and is
+        # what the checks compare against) or waits until this commit lands,
+        # so observers only ever see the pre- or post-rename document.
+        with _locked(self, exclusive=True):
+            document = self._read()
+            if source not in document["keys"]:
+                raise KeyError(f"unknown key {source!r}")
+            entry = document["keys"][source]
+            # Precondition outranks the target-exists and mapping checks, and
+            # therefore every per-version authentication failure as well.
+            self._check_active_precondition(entry, source, expected_active)
+            if target in document["keys"]:
+                raise ValueError(f"目标键已存在：{target!r}")
+            source_records = entry["versions"]
+            # Every mapped version must exist up front: an entry for a version
+            # the source never had is an unknown version, even though a sealed
+            # version missing from the map is discovered (as a missing
+            # passphrase) during the ascending walk below.
+            for number in normalised:
+                self._record_in(entry, source, number)
+            # Authenticate the whole history, in ascending order, against this
+            # one snapshot. Revoked records are opened too (allow_revoked) so
+            # a bad/missing passphrase on one still aborts, while the revoked
+            # mark is carried over rather than raised as RevokedVersionError.
+            opened: list[tuple[dict, int, bytes | None]] = []
+            for item in source_records:
+                number = self._version_number(item, source)
+                scheme = item["scheme"]
+                if scheme == PLAIN_SCHEME:
+                    # Plain records need no passphrase: an entry naming this
+                    # version is simply ignored, and the record moves verbatim.
+                    opened.append((item, number, None))
+                    continue
+                if scheme == LEGACY_DERIVE_SCHEME:
+                    # Only a derived value was stored: the material cannot be
+                    # recovered, so it cannot be re-sealed under the new name.
+                    raise UnrecoverableRecordError(
+                        "不可恢复的旧记录：该版本仅保存了口令派生值，无法更名重封")
+                plaintext = self._material_from(
+                    item, source, normalised.get(number), allow_revoked=True)
+                opened.append((item, number, plaintext))
+            # Every version authenticated: build the target history first
+            # (PBKDF2 and salt generation happen here), touching neither the
+            # snapshot nor the caller's objects until this whole list is ready,
+            # so an unexpected failure here still leaves keyring.json unchanged.
+            rebuilt: list[dict] = []
+            for item, number, plaintext in opened:
+                if item["scheme"] == PLAIN_SCHEME:
+                    # Byte-for-byte the same record, extension fields included.
+                    rebuilt.append(item)
+                    continue
+                record = self._sealed_v2_record(
+                    number, target, plaintext,
+                    normalised[number], int(item["iterations"]))
+                record["revoked"] = bool(item["revoked"])
+                # Extension fields on a sealed record travel with it; only the
+                # standard sealing parameters are replaced by the fresh v2
+                # values above.
+                for name, value in item.items():
+                    if name not in _STANDARD_RECORD_FIELDS:
+                        record[name] = value
+                rebuilt.append(record)
+            # Swap the name in place so the target occupies the source's
+            # position; the same entry dict (active and any extension fields
+            # preserved) is republished under the new name with the rebuilt
+            # history. Other entries and top-level fields are untouched.
+            keys = document["keys"]
+            document["keys"] = {
+                (target if name == source else name):
+                    (entry if name == source else value)
+                for name, value in keys.items()}
+            entry["versions"] = rebuilt
+            self._write(document)
+
     def versions(self, key_id: str) -> list[int]:
         self._check_key_id(key_id)
         with _locked(self, exclusive=False):
@@ -1193,10 +1351,14 @@ class KeyRing:
     # Call only while holding the load snapshot: the record is fresh from the
     # document read under the shared lock and no writer can commit until this
     # returns, so revocation state observed here stays true through decrypt.
-    def _material_from(self, record: dict, key_id: str, password: str | None) -> bytes:
+    # ``allow_revoked`` is used solely by ``rename_key``: a rename authenticates
+    # every historical version (a wrong/missing passphrase on a revoked sealed
+    # record must still abort the rename) while never refusing the revoked one.
+    def _material_from(self, record: dict, key_id: str, password: str | None,
+                       *, allow_revoked: bool = False) -> bytes:
         if not isinstance(record, dict) or "scheme" not in record:
             raise CorruptRecordError("记录损坏：缺少封存方案")
-        if record.get("revoked"):
+        if record.get("revoked") and not allow_revoked:
             raise RevokedVersionError(f"version {record.get('version')!r} of {key_id!r} 已吊销")
         scheme = record["scheme"]
         if scheme == PLAIN_SCHEME:
