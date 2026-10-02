@@ -159,6 +159,20 @@ class _BatchRequest(NamedTuple):
     revoke_source: bool = False
 
 
+class _LoadRequest(NamedTuple):
+    """One normalised item of a ``load_batch`` request list.
+
+    Defaults mirror ``load`` exactly: only ``key_id`` is required; ``version``
+    defaults to ``None`` (the active version) and ``password`` to ``None``.
+    Unlike the rotation batch, a key_id may appear any number of times, even
+    asking for different historical versions in one batch.
+    """
+
+    key_id: str
+    version: int | None = None
+    password: str | None = None
+
+
 def _record_field(record: dict, name: str):
     if not isinstance(record, dict) or name not in record:
         raise CorruptRecordError(f"记录损坏：字段 {name} 缺失或参数不全")
@@ -491,6 +505,41 @@ class KeyRing:
                 version=version, iterations=iterations, revoke_source=revoke_source))
         return normalised
 
+    @staticmethod
+    def _check_load_requests(requests) -> list[_LoadRequest]:
+        """Validate and normalise a whole ``load_batch`` before storage access.
+
+        The outer value must be a non-empty list of plain dicts; every item
+        must name ``key_id`` and may additionally name only ``version`` and
+        ``password``. A missing/``None`` version means the active version; a
+        version must otherwise be a non-bool positive integer, and a
+        passphrase must be a string or ``None``. The same ``key_id`` may appear
+        repeatedly, including for different historical versions. The caller's
+        objects are only read, never copied from or mutated: the returned
+        tuples are what the open phase works from.
+        """
+        if not isinstance(requests, list) or not requests:
+            raise ValueError("requests must be a non-empty list")
+        allowed = frozenset(_LoadRequest._fields)
+        normalised: list[_LoadRequest] = []
+        for request in requests:
+            if not isinstance(request, dict):
+                raise ValueError("each request must be a dict")
+            fields = request.keys()
+            unknown = fields - allowed
+            if unknown:
+                raise ValueError(f"unknown field {next(iter(unknown))!r}")
+            if "key_id" not in request:
+                raise ValueError("missing field 'key_id'")
+            key_id = KeyRing._check_key_id(request["key_id"])
+            version = KeyRing._check_version(request.get("version"))
+            password = request.get("password")
+            if password is not None and not isinstance(password, str):
+                raise ValueError("password must be a string or None")
+            normalised.append(_LoadRequest(key_id=key_id, version=version,
+                                           password=password))
+        return normalised
+
     def _entry(self, document: dict, key_id: str) -> dict:
         # The whole document (this entry included) was validated by _read()
         # under the same lock snapshot; here we only resolve the key.
@@ -694,6 +743,52 @@ class KeyRing:
             entry = self._entry(self._read(), key_id)
             record = self._record_in(entry, key_id, version)
             return self._material_from(record, key_id, password)
+
+    def load_batch(self, requests) -> list[bytes]:
+        """Open several materials from one key ring against one snapshot.
+
+        ``requests`` is a non-empty list of dicts; each item requires
+        ``key_id`` and may additionally name only ``version`` and
+        ``password`` with the same defaults and rules as :meth:`load`. The
+        whole list is structurally validated first, without touching storage,
+        and the caller's objects are never mutated. A ``key_id`` may appear
+        repeatedly, including requests for different historical versions.
+
+        Every item is resolved against one committed snapshot taken under a
+        shared lock: active pointers, revocation state and record contents all
+        come from the same document, so a concurrent batch rotation,
+        ``set_active`` or ``revoke`` is observed only whole, as the state
+        entirely before its commit or entirely after it; a change committed
+        after the batch finished never negates the materials already read.
+        The whole store is validated first, so structural damage in a record
+        no item requested still raises ``CorruptRecordError``. Items are then
+        opened in request order with ``load``'s exact verdicts; the first
+        failure aborts the batch and no partial materials are returned. On
+        success the materials come back in request order, preserving
+        duplicates; ``keyring.json`` is never rewritten.
+        """
+        normalised = self._check_load_requests(requests)
+        # One shared-lock snapshot for the whole batch, exactly like load:
+        # version resolution (including active defaults), revocation checks
+        # and decryption all see the same committed document, and no writer
+        # (a batch rotation, set_active or revoke) can commit in between.
+        with _locked(self, exclusive=False):
+            document = self._read()
+            entries: dict[str, dict] = {}
+            materials: list[bytes] = []
+            for request in normalised:
+                # Resolve and open strictly in request order so the first
+                # failing item is the one reported (a set lookup here could
+                # surface a later unknown key first); nothing is returned on
+                # failure, so earlier decrypted materials never escape.
+                entry = entries.get(request.key_id)
+                if entry is None:
+                    entry = self._entry(document, request.key_id)
+                    entries[request.key_id] = entry
+                record = self._record_in(entry, request.key_id, request.version)
+                materials.append(
+                    self._material_from(record, request.key_id, request.password))
+        return materials
 
     # Call only while holding the load snapshot: the record is fresh from the
     # document read under the shared lock and no writer can commit until this
