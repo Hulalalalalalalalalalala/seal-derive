@@ -531,6 +531,106 @@ class KeyRing:
             self._write(document)
         return new_version
 
+    def _check_batch_requests(self, requests: list[dict]) -> list[dict]:
+        """Validate a whole batch before the lock or storage are touched.
+
+        Shape, required fields, the field whitelist, per-value types (the same
+        rules and defaults as ``rotate_password``) and in-batch duplicate key
+        names all raise ``ValueError``. The caller's objects are never read
+        again afterwards, let alone mutated: a sanitised copy is what the
+        transaction consumes.
+        """
+        if not isinstance(requests, list) or not requests:
+            raise ValueError("requests must be a non-empty list of dictionaries")
+        allowed = {"key_id", "new_password", "password", "version",
+                   "iterations", "revoke_source"}
+        normalized: list[dict] = []
+        seen: set[str] = set()
+        for request in requests:
+            if not isinstance(request, dict):
+                raise ValueError("each request must be a dictionary")
+            unknown = set(request) - allowed
+            if unknown:
+                raise ValueError(f"unknown request field: {sorted(unknown)[0]!r}")
+            if "key_id" not in request:
+                raise ValueError("key_id is required")
+            if "new_password" not in request:
+                raise ValueError("new_password is required")
+            key_id = self._check_key_id(request["key_id"])
+            if not isinstance(request["new_password"], str):
+                raise ValueError("new_password must be a string")
+            password = request.get("password")
+            if password is not None and not isinstance(password, str):
+                raise ValueError("password must be a string or None")
+            version = self._check_version(request.get("version"))
+            iterations = request.get("iterations", 200_000)
+            if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
+                raise ValueError("iterations must be positive")
+            revoke_source = request.get("revoke_source", False)
+            if not isinstance(revoke_source, bool):
+                raise ValueError("revoke_source must be a boolean")
+            if key_id in seen:
+                raise ValueError(f"duplicate key_id in batch: {key_id!r}")
+            seen.add(key_id)
+            normalized.append({
+                "key_id": key_id,
+                "new_password": request["new_password"],
+                "password": password,
+                "version": version,
+                "iterations": iterations,
+                "revoke_source": revoke_source,
+            })
+        return normalized
+
+    def rotate_password_batch(self, requests: list[dict]) -> list[int]:
+        """Rotate several keys' passphrases as one committed change.
+
+        Each item names one key (``key_id`` + ``new_password`` required; the
+        other fields and defaults mirror ``rotate_password``) and a key may
+        appear at most once. Every source is resolved and authenticated against
+        one committed snapshot -- defaulting to that key's ``active`` version,
+        plain ignoring the old password, v1/v2 authenticating it -- before any
+        new record is appended: the first failure in request order is reported
+        and the file is never written. On success every key gets a fresh v2
+        record (new salt, requested iteration count, tag bound to the full key
+        name and the new max+1 version), the new versions are unrevoked and
+        active, only each item's own source may be revoked, and the new version
+        numbers come back in request order via a single atomic replace.
+        """
+        normalized = self._check_batch_requests(requests)
+        # One exclusive lock for the whole transaction: concurrent callers only
+        # ever see the state before or after the entire batch, and a concurrent
+        # seal/rotation queues behind this snapshot so no history is lost.
+        with _locked(self, exclusive=True):
+            document = self._read()
+            # Recover every source from the same validated snapshot and keep
+            # the material bytes before mutating a single entry. Any error
+            # (unknown key/version, revoked/unrecoverable source, missing or
+            # bad password, corruption) leaves ``document`` unmodified here and
+            # therefore keyring.json byte-for-byte unchanged.
+            plan: list[tuple[dict, str, dict, int, bytes, dict]] = []
+            for request in normalized:
+                key_id = request["key_id"]
+                entry = self._entry(document, key_id)
+                source = self._record_in(entry, key_id, request["version"])
+                plaintext = self._material_from(source, key_id, request["password"])
+                plan.append((entry, key_id, source, request["iterations"], plaintext, request))
+            new_versions: list[int] = []
+            for entry, key_id, source, iterations, plaintext, request in plan:
+                new_version = max(
+                    (self._version_number(item, key_id) for item in entry["versions"]),
+                    default=0) + 1
+                record = self._sealed_v2_record(
+                    new_version, key_id, plaintext, request["new_password"], iterations)
+                record["revoked"] = False
+                entry["versions"].append(record)
+                entry["active"] = new_version
+                if request["revoke_source"]:
+                    source["revoked"] = True
+                new_versions.append(new_version)
+            self._write(document)
+        return new_versions
+
     def versions(self, key_id: str) -> list[int]:
         self._check_key_id(key_id)
         with _locked(self, exclusive=False):
