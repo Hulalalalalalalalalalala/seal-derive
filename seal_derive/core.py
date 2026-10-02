@@ -201,6 +201,24 @@ class _SetActiveRequest(NamedTuple):
     expected_active: int | None = None
 
 
+class _RevokeRequest(NamedTuple):
+    """One normalised item of a ``revoke_batch`` request list.
+
+    Only ``key_id`` and ``versions`` are required; the optional
+    ``replacement_active``/``expected_active`` default to ``None`` (keep the
+    active pointer / no active-version precondition). Each named version is
+    revoked, and a replacement (itself never one of this item's revoked
+    versions and not already revoked) repoints the key's active pointer
+    regardless of whether the current active version was revoked. A key_id
+    may appear at most once, mirroring ``set_active_batch``.
+    """
+
+    key_id: str
+    versions: list[int]
+    replacement_active: int | None = None
+    expected_active: int | None = None
+
+
 def _record_field(record: dict, name: str):
     if not isinstance(record, dict) or name not in record:
         raise CorruptRecordError(f"记录损坏：字段 {name} 缺失或参数不全")
@@ -484,15 +502,17 @@ class KeyRing:
         return version
 
     @staticmethod
-    def _check_expected_active(expected_active: int | None) -> int | None:
+    def _check_expected_active(expected_active: int | None,
+                               name: str = "expected_active") -> int | None:
         # ``None`` (or omitting the argument) keeps the unconditional
         # behaviour; anything else must be a non-bool positive integer and is
-        # rejected before any storage is touched.
+        # rejected before any storage is touched. ``name`` lets the batch
+        # checker report the offending field (e.g. ``replacement_active``).
         if expected_active is None:
             return None
         if isinstance(expected_active, bool) or not isinstance(expected_active, int) \
                 or expected_active <= 0:
-            raise ValueError("expected_active must be a positive integer")
+            raise ValueError(f"{name} must be a positive integer")
         return expected_active
 
     @staticmethod
@@ -642,6 +662,62 @@ class KeyRing:
                 request.get("expected_active"))
             normalised.append(_SetActiveRequest(
                 key_id=key_id, version=version,
+                expected_active=expected_active))
+        return normalised
+
+    @staticmethod
+    def _check_revoke_requests(requests) -> list[_RevokeRequest]:
+        """Validate and normalise a whole ``revoke_batch`` before storage.
+
+        The outer value must be a non-empty list of plain dicts; every item
+        must name exactly ``key_id`` and ``versions`` plus any subset of
+        ``replacement_active``/``expected_active``. ``versions`` must be a
+        non-empty list of distinct non-bool positive integers (list order is
+        the lookup/report order), and both optional values must be
+        ``None``/omitted or a non-bool positive integer. A ``key_id`` may
+        appear only once. The caller's objects are only read, never copied
+        from or mutated: the returned tuples (with a fresh list each) are
+        what the commit phase works from.
+        """
+        if not isinstance(requests, list) or not requests:
+            raise ValueError("requests must be a non-empty list")
+        allowed = frozenset(_RevokeRequest._fields)
+        required = ("key_id", "versions")
+        normalised: list[_RevokeRequest] = []
+        seen: set[str] = set()
+        for request in requests:
+            if not isinstance(request, dict):
+                raise ValueError("each request must be a dict")
+            fields = request.keys()
+            unknown = fields - allowed
+            if unknown:
+                raise ValueError(f"unknown field {next(iter(unknown))!r}")
+            missing = [name for name in required if name not in request]
+            if missing:
+                raise ValueError(f"missing field {missing[0]!r}")
+            key_id = KeyRing._check_key_id(request["key_id"])
+            if key_id in seen:
+                raise ValueError(f"duplicate key_id {key_id!r} in batch")
+            seen.add(key_id)
+            versions = request["versions"]
+            if not isinstance(versions, list) or not versions:
+                raise ValueError("versions must be a non-empty list")
+            normalised_versions: list[int] = []
+            seen_versions: set[int] = set()
+            for number in versions:
+                if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+                    raise ValueError("versions must be positive integers")
+                if number in seen_versions:
+                    raise ValueError(f"duplicate version {number!r} in request")
+                seen_versions.add(number)
+                normalised_versions.append(number)
+            replacement_active = KeyRing._check_expected_active(
+                request.get("replacement_active"), "replacement_active")
+            expected_active = KeyRing._check_expected_active(
+                request.get("expected_active"))
+            normalised.append(_RevokeRequest(
+                key_id=key_id, versions=normalised_versions,
+                replacement_active=replacement_active,
                 expected_active=expected_active))
         return normalised
 
@@ -1052,6 +1128,108 @@ class KeyRing:
             if changed:
                 for entry, version in resolved:
                     entry["active"] = version
+                self._write(document)
+
+    def revoke_batch(self, requests) -> None:
+        """Revoke several keys' historical versions atomically.
+
+        Python API only: there is no CLI subcommand. ``requests`` is a
+        non-empty list of dicts; each item requires ``key_id`` and
+        ``versions`` (a non-empty list of distinct non-bool positive
+        integers, checked in list order) and may additionally name only
+        ``replacement_active`` and ``expected_active``. Either optional
+        value omitted/``None`` means, respectively, keep the active pointer
+        where it is and perform no precondition check; otherwise each must be
+        a non-bool positive integer. Bad structure, non-dict items, missing
+        or unknown fields, illegal values, duplicate request versions or a
+        repeated ``key_id`` all raise ``ValueError`` for the whole batch
+        before storage is touched, and the caller's objects are never
+        mutated.
+
+        Every item is judged against one committed snapshot: the whole store
+        is structurally validated first (damage in an unrequested record
+        still raises ``CorruptRecordError``), then items are checked in
+        request order -- key existence (``KeyError``), the
+        ``expected_active`` precondition compared against the current active
+        *number* only (``ActiveVersionConflictError``; the expected version
+        need not exist), every requested version's existence in list order
+        (``KeyError``; an already-revoked version is fine to revoke again)
+        and, last, the replacement version's existence
+        (``KeyError``) and non-revocation (``RevokedVersionError`` -- a
+        version that is already revoked or is named in this item's
+        ``versions`` can never become the new pointer). The first failure
+        aborts the batch before any revocation or pointer move, so
+        ``keyring.json`` keeps its exact prior bytes.
+
+        On success all revocation marks and pointer moves commit together in
+        one atomic replace. Without a replacement the pointer is kept even
+        when the active version is one of the revoked versions (mirroring the
+        single-key ``revoke``); with a replacement the pointer always moves
+        to it, whether or not the previous active version was revoked. No
+        versions or sealing material are added, decrypted or removed; other
+        keys, histories and derived parameters are untouched. A batch whose
+        whole effect is already in place (every target already revoked and
+        every replacement already active) still runs every check but does not
+        rewrite the file. A concurrent ``load_batch`` or any other caller
+        observes only the state before the batch or after it. A missing store
+        raises ``FileNotFoundError``, waiting over five seconds for the write
+        lock raises ``TimeoutError``, and other storage failures propagate as
+        ``OSError``.
+        """
+        normalised = self._check_revoke_requests(requests)
+        # One exclusive lock for the whole batch, exactly like
+        # set_active_batch: the snapshot, every per-item check and the single
+        # atomic commit share one critical section, so concurrent callers
+        # observe either the pre-batch state or the post-batch state and no
+        # failure path can persist part of the batch.
+        with _locked(self, exclusive=True):
+            document = self._read()
+            # Resolve every item in request order first; the first failure
+            # (unknown key, active conflict, unknown target version, revoked
+            # or self-revoking replacement) aborts before any mark or pointer
+            # changes anywhere.
+            resolved: list[tuple[dict, list[dict], int | None, bool]] = []
+            changed = False
+            for request in normalised:
+                entry = self._entry(document, request.key_id)
+                # Per item, in request order: key lookup, then the active
+                # precondition, then each revoked version in list order, and
+                # the replacement last -- mirroring set_active_batch's
+                # precedence with the revocation targets inserted before it.
+                self._check_active_precondition(
+                    entry, request.key_id, request.expected_active)
+                targets: list[dict] = []
+                for number in request.versions:
+                    targets.append(
+                        self._record_in(entry, request.key_id, number))
+                replacement_record = None
+                will_move = False
+                if request.replacement_active is not None:
+                    replacement_record = self._record_in(
+                        entry, request.key_id, request.replacement_active)
+                    # A pointer may never move onto a revoked version, and a
+                    # version this item revokes cannot be its own replacement.
+                    if replacement_record.get("revoked") or any(
+                            target is replacement_record for target in targets):
+                        raise RevokedVersionError(
+                            f"version {request.replacement_active!r} of "
+                            f"{request.key_id!r} 已吊销")
+                    if request.replacement_active != int(entry["active"]):
+                        will_move = True
+                if will_move or any(not target.get("revoked")
+                                   for target in targets):
+                    changed = True
+                resolved.append((entry, targets, request.replacement_active,
+                                 will_move))
+            # Every check passed: revoke, then repoint, together. Distinct
+            # key_ids (checked up front) mean each entry appears at most once,
+            # so the marks and the single pointer move can never fight.
+            if changed:
+                for entry, targets, replacement, will_move in resolved:
+                    for target in targets:
+                        target["revoked"] = True
+                    if will_move:
+                        entry["active"] = replacement
                 self._write(document)
 
     def revoke(self, key_id: str, version: int) -> None:
