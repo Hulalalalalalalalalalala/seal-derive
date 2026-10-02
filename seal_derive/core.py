@@ -172,6 +172,24 @@ class _BatchRequest(NamedTuple):
     expected_active: int | None = None
 
 
+class _SealRequest(NamedTuple):
+    """One normalised item of a ``seal_batch`` request list.
+
+    Defaults mirror ``seal`` exactly: only ``key_id`` and ``material`` are
+    required; ``password`` defaults to ``None`` (a plain record), ``iterations``
+    to 200_000 and ``expected_active`` to ``None`` (no precondition). Unlike
+    every other batch, ``expected_active`` may also be ``0``: that asks the key
+    not to exist yet, and a missing key's actual active is read as ``0``. A
+    key_id may appear at most once, mirroring the other mutating batches.
+    """
+
+    key_id: str
+    material: str
+    password: str | None = None
+    iterations: int = 200_000
+    expected_active: int | None = None
+
+
 class _LoadRequest(NamedTuple):
     """One normalised item of a ``load_batch`` request list.
 
@@ -534,6 +552,26 @@ class KeyRing:
                 f"实际活动版本为 {actual}")
 
     @staticmethod
+    def _check_expected_seal_active(actual: int, key_id: str,
+                                   expected_active: int | None) -> None:
+        """Check a ``seal_batch`` precondition against the snapshot's active.
+
+        Unlike every other batch, the key need not exist: a missing key's
+        actual active version is reported as ``0``, which is also the only value
+        a precondition of ``0`` may match (``0`` means "the key must not
+        exist yet"). The conflict message mirrors the other batches exactly, so an
+        existing key checked against ``0`` reads "预期活动版本为 0，实际活动版本
+        为 N" and a missing key checked against a positive value reads "...实际
+        活动版本为 0".
+        """
+        if expected_active is None:
+            return
+        if actual != expected_active:
+            raise ActiveVersionConflictError(
+                f"活动版本冲突：{key_id!r} 的预期活动版本为 {expected_active}，"
+                f"实际活动版本为 {actual}")
+
+    @staticmethod
     def _check_batch_requests(requests) -> list[_BatchRequest]:
         """Validate and normalise a whole batch before any storage is touched.
 
@@ -721,6 +759,64 @@ class KeyRing:
                 expected_active=expected_active))
         return normalised
 
+    @staticmethod
+    def _check_seal_requests(requests) -> list[_SealRequest]:
+        """Validate and normalise a whole ``seal_batch`` before storage.
+
+        The outer value must be a non-empty list of plain dicts; every item
+        must name exactly ``key_id`` and ``material`` plus any subset of
+        ``password``/``iterations``/``expected_active``. ``material`` must be a
+        string (empty is legal), ``password`` a string or ``None`` (an empty
+        string is a valid passphrase; only ``None``/omitted means plain),
+        ``iterations`` a non-bool positive integer defaulting to 200_000, and
+        ``expected_active`` a non-bool non-negative integer: ``0`` asks the key
+        not to exist, a positive value asks the current active to equal it, and
+        ``None``/omitted skips the check. A ``key_id`` may appear only once.
+        The caller's objects are only read, never copied from or mutated: the
+        returned tuples are what the commit phase works from.
+        """
+        if not isinstance(requests, list) or not requests:
+            raise ValueError("requests must be a non-empty list")
+        allowed = frozenset(_SealRequest._fields)
+        required = ("key_id", "material")
+        normalised: list[_SealRequest] = []
+        seen: set[str] = set()
+        for request in requests:
+            if not isinstance(request, dict):
+                raise ValueError("each request must be a dict")
+            fields = request.keys()
+            unknown = fields - allowed
+            if unknown:
+                raise ValueError(f"unknown field {next(iter(unknown))!r}")
+            missing = [name for name in required if name not in request]
+            if missing:
+                raise ValueError(f"missing field {missing[0]!r}")
+            key_id = KeyRing._check_key_id(request["key_id"])
+            if key_id in seen:
+                raise ValueError(f"duplicate key_id {key_id!r} in batch")
+            seen.add(key_id)
+            material = request["material"]
+            if not isinstance(material, str):
+                raise ValueError("material must be a string")
+            password = request.get("password")
+            if password is not None and not isinstance(password, str):
+                raise ValueError("password must be a string or None")
+            iterations = request.get("iterations", 200_000)
+            if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
+                raise ValueError("iterations must be positive")
+            expected_active = request.get("expected_active")
+            # Distinct from _check_expected_active: seal_batch is the only
+            # entry point where 0 is legal ("the key must not exist").
+            if expected_active is not None and (
+                    isinstance(expected_active, bool)
+                    or not isinstance(expected_active, int)
+                    or expected_active < 0):
+                raise ValueError("expected_active must be a non-negative integer")
+            normalised.append(_SealRequest(
+                key_id=key_id, material=material, password=password,
+                iterations=iterations, expected_active=expected_active))
+        return normalised
+
     def _entry(self, document: dict, key_id: str) -> dict:
         # The whole document (this entry included) was validated by _read()
         # under the same lock snapshot; here we only resolve the key.
@@ -791,6 +887,110 @@ class KeyRing:
             entry["active"] = version
             self._write(document)
         return version
+
+    def seal_batch(self, requests) -> list[int]:
+        """Seal several materials -- new keys and further versions of old ones --
+        in one atomic change.
+
+        ``requests`` is a non-empty list of dicts; each item requires
+        ``key_id`` and ``material`` and may additionally name only ``password``,
+        ``iterations`` and ``expected_active``. Rules and defaults mirror
+        :meth:`seal`: ``material`` must be a string (empty allowed); a missing
+        or ``None`` ``password`` writes a ``plain`` record, while any string --
+        including the empty string -- writes a ``pbkdf2-sha256-sealed-v2``
+        record with a fresh salt, the given iteration count, and the tag bound to
+        the full key name and the new version number; ``iterations`` defaults
+        to 200_000 and must be a non-bool positive integer.
+        ``expected_active`` (omitted/``None`` skips the check) may be a
+        non-bool non-negative integer: ``0`` requires the key not to exist
+        yet, a positive value requires the current active version to equal it.
+        Bad structure, non-dict items, missing or unknown fields, illegal values and
+        a repeated ``key_id`` all raise ``ValueError`` for the whole batch
+        before storage is touched, and the caller's objects are never mutated.
+
+        Every item is judged against one committed snapshot: the whole store is
+        structurally validated first (damage in an unrequested record still
+        raises ``CorruptRecordError``), then items are checked in request order.
+        A missing key counts as active version ``0``; a precondition mismatch
+        raises :class:`ActiveVersionConflictError` using the same wording as the
+        other batches, naming ``0`` as the actual value for a missing key, and
+        only the first conflict is reported. The new version number is 1 for a
+        new key and that key's history max plus one for an existing one; each
+        new version is unrevoked and becomes the key's active pointer, while
+        older history and keys not named in the batch are untouched. The first
+        failure aborts the batch before any record is built, so
+        ``keyring.json`` keeps its exact prior bytes and no partial version
+        list is returned.
+
+        On success every record commits together in one atomic replace and the new
+        version numbers come back in request order. A recovered material is
+        byte-identical to :meth:`seal`'s, and loading a sealed item needs
+        that item's passphrase. Concurrent callers observe only the state before
+        the batch or after it: of two batches expecting the same key to be
+        absent (``0``) or at the same old active version, at most one may
+        commit. A missing store raises ``FileNotFoundError``, waiting over five
+        seconds for the write lock raises ``TimeoutError``, a structurally
+        damaged store raises ``CorruptRecordError``, and other storage failures
+        propagate as ``OSError``. Empty materials, empty passphrases and
+        Unicode key names/materials keep working.
+        """
+        normalised = self._check_seal_requests(requests)
+        # One exclusive lock for the whole batch, exactly like the other
+        # mutating batches: the snapshot, every per-item precondition and the
+        # single atomic commit share one critical section, so concurrent callers
+        # observe either the pre-batch document or the post-batch document and
+        # no failure path can persist part of the batch.
+        with _locked(self, exclusive=True):
+            document = self._read()
+            # Resolve every item in request order first; the first failure (a
+            # precondition conflict) aborts before any entry or record is built
+            # anywhere. Distinct key_ids (checked up front) mean each entry is
+            # touched by at most one item, so per-key numbers cannot collide.
+            planned: list[tuple[_SealRequest, dict | None, int]] = []
+            for request in normalised:
+                entry = document["keys"].get(request.key_id)
+                # Missing key -> actual 0: expected_active 0 matches and the
+                # key is created below; a positive expected value conflicts and is
+                # reported with the standard message before anything is created.
+                actual = 0 if entry is None else int(entry["active"])
+                self._check_expected_seal_active(
+                    actual, request.key_id, request.expected_active)
+                if entry is None:
+                    new_version = 1
+                else:
+                    new_version = max(
+                        (self._version_number(item, request.key_id)
+                         for item in entry["versions"]), default=0) + 1
+                planned.append((request, entry, new_version))
+            # Every precondition passed: build every record first (secrets.token_
+            # bytes and PBKDF2 run here), and only then touch the document,
+            # so even an error while building one record leaves the snapshot
+            # untouched and keyring.json byte-for-byte unchanged.
+            built: list[tuple[_SealRequest, dict | None, dict, int]] = []
+            for request, entry, new_version in planned:
+                if request.password is None:
+                    record = {"version": new_version, "scheme": PLAIN_SCHEME,
+                               "material": base64.b64encode(
+                                   request.material.encode("utf-8")).decode("ascii")}
+                else:
+                    record = self._sealed_v2_record(
+                        new_version, request.key_id,
+                        request.material.encode("utf-8"),
+                        request.password, request.iterations)
+                record["revoked"] = False
+                built.append((request, entry, record, new_version))
+            new_versions: list[int] = []
+            for request, entry, record, new_version in built:
+                # A new key's entry is inserted at commit time, never during
+                # the check pass, so an aborted batch leaves no phantom key.
+                if entry is None:
+                    entry = document["keys"].setdefault(
+                        request.key_id, {"versions": [], "active": 0})
+                entry["versions"].append(record)
+                entry["active"] = new_version
+                new_versions.append(new_version)
+            self._write(document)
+        return new_versions
 
     def rotate_password(self, key_id: str, new_password: str, password: str | None = None,
                         version: int | None = None, iterations: int = 200_000,
