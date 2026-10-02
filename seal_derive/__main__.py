@@ -59,6 +59,7 @@ def _parser() -> argparse.ArgumentParser:
     rotate.add_argument("--version", type=int)
     rotate.add_argument("--iterations", type=int, default=200_000)
     rotate.add_argument("--revoke-source", action="store_true")
+    rotate.add_argument("--expected-active", type=int, default=None)
     for verb in ("set-active", "revoke"):
         node = sub.add_parser(verb); node.add_argument("key_id"); node.add_argument("version", type=int)
     sub.add_parser("report", help="print this domain's report as JSON")
@@ -76,7 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "rotate-password":
             print(ring.rotate_password(
                 args.key_id, args.new_password, args.password,
-                args.version, args.iterations, args.revoke_source))
+                args.version, args.iterations, args.revoke_source,
+                expected_active=args.expected_active))
         elif args.command == "load":
             sys.stdout.buffer.write(ring.load(args.key_id, args.version, args.password) + b"\n")
         elif args.command == "versions":

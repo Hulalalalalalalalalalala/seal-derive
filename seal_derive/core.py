@@ -133,6 +133,19 @@ class UnrecoverableRecordError(SealError):
     """A legacy derived-only record cannot yield the original material."""
 
 
+class ActiveVersionConflictError(SealError):
+    """An ``expected_active`` precondition did not match the current active.
+
+    Raised by a conditional password rotation when the caller pinned an
+    active version that no longer points at the version the caller based its
+    request on. It is a :class:`SealError` (CLI exit code 1) rather than a
+    usage error: the inputs were legal, but the committed state moved under
+    the caller and retrying against the new active is the intended response.
+    The comparison only concerns the active pointer -- it does not require
+    the source version to equal it, nor an unchanged version history.
+    """
+
+
 class RevokedVersionError(ValueError):
     """A revoked version was requested through ``load``.
 
@@ -148,7 +161,8 @@ class _BatchRequest(NamedTuple):
     ``key_id`` and ``new_password`` are required; the old ``password`` defaults
     to ``None`` (active sources are plain in the un-sealed case, otherwise the
     sealed check reports the missing passphrase), ``version`` to active,
-    ``iterations`` to 200_000 and ``revoke_source`` to ``False``.
+    ``iterations`` to 200_000, ``revoke_source`` to ``False`` and
+    ``expected_active`` to ``None`` (no precondition).
     """
 
     key_id: str
@@ -157,6 +171,7 @@ class _BatchRequest(NamedTuple):
     version: int | None = None
     iterations: int = 200_000
     revoke_source: bool = False
+    expected_active: int | None = None
 
 
 class _LoadRequest(NamedTuple):
@@ -456,16 +471,33 @@ class KeyRing:
         return version
 
     @staticmethod
+    def _check_expected_active(expected_active: int | None) -> int | None:
+        """Validate the conditional-rotation precondition.
+
+        ``None`` (also when omitted) disables the precondition entirely; any
+        other value must be a non-bool positive int. The value is only ever
+        compared to the entry's current ``active`` pointer, so it need not be
+        a version the source itself was sealed as, and a changed-but-repointed
+        history alone does not invalidate it.
+        """
+        if expected_active is None:
+            return None
+        if (isinstance(expected_active, bool)
+                or not isinstance(expected_active, int) or expected_active <= 0):
+            raise ValueError("expected_active must be a positive integer or None")
+        return expected_active
+
+    @staticmethod
     def _check_batch_requests(requests) -> list[_BatchRequest]:
         """Validate and normalise a whole batch before any storage is touched.
 
         The outer value must be a non-empty list of plain dicts; every item
         must name exactly ``key_id`` and ``new_password`` plus any subset of
-        ``password``/``version``/``iterations``/``revoke_source``. Per-field
-        rules and defaults are identical to ``rotate_password``, and a
-        ``key_id`` may only appear once in the batch. The caller's objects are
-        only read, never copied from or mutated: the returned tuples are what
-        the commit phase works from.
+        ``password``/``version``/``iterations``/``revoke_source``/
+        ``expected_active``. Per-field rules and defaults are identical to
+        ``rotate_password``, and a ``key_id`` may only appear once in the
+        batch. The caller's objects are only read, never copied from or
+        mutated: the returned tuples are what the commit phase works from.
         """
         if not isinstance(requests, list) or not requests:
             raise ValueError("requests must be a non-empty list")
@@ -500,9 +532,12 @@ class KeyRing:
             revoke_source = request.get("revoke_source", False)
             if not isinstance(revoke_source, bool):
                 raise ValueError("revoke_source must be a boolean")
+            expected_active = KeyRing._check_expected_active(
+                request.get("expected_active"))
             normalised.append(_BatchRequest(
                 key_id=key_id, new_password=new_password, password=password,
-                version=version, iterations=iterations, revoke_source=revoke_source))
+                version=version, iterations=iterations, revoke_source=revoke_source,
+                expected_active=expected_active))
         return normalised
 
     @staticmethod
@@ -546,6 +581,26 @@ class KeyRing:
         if key_id not in document["keys"]:
             raise KeyError(f"unknown key {key_id!r}")
         return document["keys"][key_id]
+
+    @staticmethod
+    def _check_active_precondition(entry: dict, key_id: str,
+                                   expected_active: int | None) -> None:
+        """Compare the precondition against the snapshot's active pointer.
+
+        Only the active version number is compared: the source version is not
+        required to equal it, and an otherwise unchanged history still passes.
+        Call only after the key itself was resolved, so an unknown key reports
+        ``KeyError`` rather than a conflict; call before opening the source, so
+        a stale caller conflicts even when its named source is revoked or its
+        old passphrase is wrong. The entry was validated by ``_read()``.
+        """
+        if expected_active is None:
+            return
+        actual = int(entry["active"])
+        if actual != expected_active:
+            raise ActiveVersionConflictError(
+                f"活动版本冲突：键 {key_id} 的当前活动版本为 {actual}，"
+                f"预期活动版本为 {expected_active}")
 
     def _version_number(self, item: dict, key_id: str) -> int:
         value = item.get("version")
@@ -613,7 +668,8 @@ class KeyRing:
 
     def rotate_password(self, key_id: str, new_password: str, password: str | None = None,
                         version: int | None = None, iterations: int = 200_000,
-                        revoke_source: bool = False) -> int:
+                        revoke_source: bool = False,
+                        expected_active: int | None = None) -> int:
         key_id = self._check_key_id(key_id)
         if not isinstance(new_password, str):
             raise ValueError("new_password must be a string")
@@ -624,13 +680,21 @@ class KeyRing:
             raise ValueError("iterations must be positive")
         if not isinstance(revoke_source, bool):
             raise ValueError("revoke_source must be a boolean")
+        expected_active = self._check_expected_active(expected_active)
         # Everything happens inside one exclusive lock: authenticate against
         # the committed snapshot (load's order and verdicts), then append the
         # re-sealed version, repoint active and optionally revoke the source
         # before a single atomic replace. No failure path mutates the file.
+        # When expected_active is pinned it is compared to the snapshot's
+        # active pointer before the source is opened: a caller acting on a
+        # stale active conflicts (ActiveVersionConflictError) even if its
+        # source is revoked or its old passphrase is wrong. The whole check
+        # and rotation are one atomic operation, so a concurrent writer can
+        # only have committed before this snapshot or after this commit.
         with _locked(self, exclusive=True):
             document = self._read()
             entry = self._entry(document, key_id)
+            self._check_active_precondition(entry, key_id, expected_active)
             source = self._record_in(entry, key_id, version)
             # Recover the original material with load's exact checks: plain
             # ignores the old password; v1/v2 authenticate it. Every failure
@@ -653,15 +717,18 @@ class KeyRing:
         """Rotate several keys in one key ring as a single change.
 
         ``requests`` is a non-empty list of dicts with the same fields as
-        :meth:`rotate_password` (``key_id`` and ``new_password`` required); the
-        whole list is structurally validated first, without touching storage.
-        Every item is then resolved against one committed snapshot: the source
-        version (active by default) is authenticated with ``load``'s exact
-        order and verdicts, and its material bytes are re-sealed as a fresh v2
-        record using a new salt. The version number is that key's own
-        history max plus one; each new version is unrevoked and active, and
-        only that item's ``revoke_source`` revokes its source. Failures are
-        reported in request order and abort the batch before any mutation, so
+        :meth:`rotate_password` (``key_id`` and ``new_password`` required),
+        including the optional ``expected_active`` precondition; the whole
+        list is structurally validated first, without touching storage.
+        Every item is then resolved against one committed snapshot: the key
+        must exist, the pinned active (if any) must still equal that entry's
+        active pointer, and the source version (active by default) is
+        authenticated with ``load``'s exact order and verdicts; its material
+        bytes are re-sealed as a fresh v2 record using a new salt. The
+        version number is that key's own history max plus one; each new
+        version is unrevoked and active, and only that item's
+        ``revoke_source`` revokes its source. Failures are reported in
+        request order and abort the batch before any mutation, so
         ``keyring.json`` keeps its exact prior bytes. On success one atomic
         replace commits every item, and the new version numbers are returned
         in request order.
@@ -674,13 +741,17 @@ class KeyRing:
         # re-read per item and no failure path can persist part of the batch.
         with _locked(self, exclusive=True):
             document = self._read()
-            # Resolve every item in request order first; the first failure
-            # (unknown key/version, revoked/unrecoverable source, missing or
-            # bad passphrase, failed authentication) aborts before the
-            # document is mutated anywhere.
+            # Resolve every item in request order first; per item the order is
+            # key existence, the expected_active precondition, then source
+            # resolution/authentication. A conflict therefore beats that
+            # item's unknown source version, revocation and passphrase
+            # failures, but never the failure of an earlier item. The first
+            # failure aborts before the document is mutated anywhere.
             resolved: list[tuple[_BatchRequest, dict, dict, bytes, int]] = []
             for request in normalised:
                 entry = self._entry(document, request.key_id)
+                self._check_active_precondition(
+                    entry, request.key_id, request.expected_active)
                 source = self._record_in(entry, request.key_id, request.version)
                 plaintext = self._material_from(
                     source, request.key_id, request.password)
