@@ -572,6 +572,29 @@ class KeyRing:
                 f"实际活动版本为 {actual}")
 
     @staticmethod
+    def _check_passwords_map(passwords) -> dict[int, str] | None:
+        """Validate a ``rename_key`` password map before any storage is touched.
+
+        ``None`` (or omitting the argument) means no passphrases were
+        supplied; otherwise the value must be a dict mapping non-bool
+        positive integer version numbers to string passphrases (an empty
+        string is a valid passphrase). The caller's mapping is only read,
+        never mutated: the returned fresh dict is what the rename works from.
+        """
+        if passwords is None:
+            return None
+        if not isinstance(passwords, dict):
+            raise ValueError("passwords must be a dict or None")
+        checked: dict[int, str] = {}
+        for number, password in passwords.items():
+            if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+                raise ValueError("passwords keys must be positive integers")
+            if not isinstance(password, str):
+                raise ValueError("passwords values must be strings")
+            checked[number] = password
+        return checked
+
+    @staticmethod
     def _check_batch_requests(requests) -> list[_BatchRequest]:
         """Validate and normalise a whole batch before any storage is touched.
 
@@ -1105,6 +1128,120 @@ class KeyRing:
                 new_versions.append(new_version)
             self._write(document)
         return new_versions
+
+    def rename_key(self, source: str, target: str, passwords=None,
+                   expected_active: int | None = None) -> None:
+        """Atomically rename ``source``'s entire history to the new ``target``.
+
+        Python API only: there is no CLI subcommand. ``source`` and
+        ``target`` must be different non-empty strings; ``passwords`` is
+        ``None`` or a dict mapping non-bool positive integer version numbers
+        to string passphrases (an empty string is a valid passphrase);
+        ``expected_active`` is ``None`` (no precondition) or a non-bool
+        positive integer. Bad input raises ``ValueError`` before any storage
+        is touched, and the caller's mapping is only read, never mutated.
+
+        Under one exclusive lock the whole store is structurally validated
+        first (damage in an unrelated record still raises
+        ``CorruptRecordError``), then checked in this order: the source key
+        exists (``KeyError``), the source's current active version equals
+        ``expected_active`` when given (:class:`ActiveVersionConflictError`),
+        the target key does not exist yet (``ValueError`` naming
+        "目标键已存在"), and every version named in ``passwords`` exists in
+        the source history (``KeyError``).
+
+        The history is then processed in ascending version order against the
+        same committed snapshot: ``plain`` records carry over unchanged and
+        ignore any mapped passphrase; legacy derived-only records raise
+        :class:`UnrecoverableRecordError`; v1/v2 records authenticate with
+        ``load``'s exact verdicts -- a missing passphrase raises
+        :class:`MissingPasswordError`, a wrong one :class:`BadPasswordError`,
+        structural damage or a failed authentication under the correct
+        passphrase :class:`CorruptRecordError`. Revoked records authenticate
+        like any other: revocation neither skips nor blocks a rename. The
+        first failure aborts before the document is mutated anywhere, so
+        ``keyring.json`` keeps its exact prior bytes.
+
+        On success the source key disappears and the target keeps the
+        original version numbers, list order, active pointer, revocation
+        marks and material bytes: every sealed record is re-sealed as
+        ``pbkdf2-sha256-sealed-v2`` bound to the target key name, using the
+        record's original passphrase, its original iteration count and a
+        fresh salt per version, while plain records and every extension
+        field carry over unchanged and other keys are untouched. Nothing is
+        returned (in particular no material); revoked versions still cannot
+        be loaded, and a later ``seal`` on the target continues from the
+        history's maximum number plus one. Concurrent callers observe only
+        the state before the rename or after it. A missing store raises
+        ``FileNotFoundError``, waiting over five seconds for the write lock
+        raises ``TimeoutError``, and other storage failures propagate as
+        ``OSError`` without leaving a partial rename. Empty passphrases,
+        empty materials and Unicode key names keep working, and key names
+        are compared as full strings.
+        """
+        if not isinstance(source, str) or not source:
+            raise ValueError("source must be a non-empty string")
+        if not isinstance(target, str) or not target:
+            raise ValueError("target must be a non-empty string")
+        if source == target:
+            raise ValueError("source and target must be different keys")
+        passwords = self._check_passwords_map(passwords)
+        expected_active = self._check_expected_active(expected_active)
+        # Everything happens inside one exclusive lock: the whole store is
+        # validated, every check and per-record authentication runs against
+        # one committed snapshot, and the rebuilt history commits in a single
+        # atomic replace. Concurrent callers observe only the state before
+        # the rename or after it, and no failure path can persist part of
+        # the move.
+        with _locked(self, exclusive=True):
+            document = self._read()
+            entry = self._entry(document, source)
+            # Check order after the whole-store validation: the source key,
+            # the active-version precondition, the target's absence, then
+            # the password map's versions -- each before any record is
+            # processed.
+            self._check_active_precondition(entry, source, expected_active)
+            if target in document["keys"]:
+                raise ValueError(f"目标键已存在：{target!r}")
+            if passwords:
+                known = {self._version_number(item, source)
+                         for item in entry["versions"]}
+                for number in passwords:
+                    if number not in known:
+                        raise KeyError(f"unknown version {number} for {source!r}")
+            # Process the history in ascending version order (the list is
+            # validated ascending): plain records carry over unchanged and
+            # ignore any mapped passphrase; legacy derived-only records can
+            # never be re-sealed; v1/v2 records authenticate exactly like
+            # load -- except that revocation never skips or blocks a record
+            # -- and are re-sealed under the target name. The first failure
+            # aborts before the document is mutated anywhere.
+            moved: list[dict] = []
+            for item in entry["versions"]:
+                scheme = item["scheme"]
+                if scheme == PLAIN_SCHEME:
+                    moved.append(dict(item))
+                    continue
+                if scheme == LEGACY_DERIVE_SCHEME:
+                    raise UnrecoverableRecordError(
+                        "不可恢复的旧记录：该版本仅保存了口令派生值，无法取回原始 material")
+                version = self._version_number(item, source)
+                password = passwords.get(version) if passwords else None
+                plaintext = self._open_sealed(item, password, source)
+                iterations = _positive_int_field(item, "iterations")
+                record = dict(item)
+                record.update(self._sealed_v2_record(
+                    version, target, plaintext, password, iterations))
+                moved.append(record)
+            # Every record authenticated: re-home the entry. Version numbers,
+            # list order, the active pointer, revocation marks, material
+            # bytes and any extension fields all carry over; other keys are
+            # untouched.
+            new_entry = dict(entry)
+            new_entry["versions"] = moved
+            document["keys"][target] = new_entry
+            del document["keys"][source]
+            self._write(document)
 
     def versions(self, key_id: str) -> list[int]:
         self._check_key_id(key_id)
