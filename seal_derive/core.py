@@ -186,6 +186,21 @@ class _LoadRequest(NamedTuple):
     password: str | None = None
 
 
+class _SetActiveRequest(NamedTuple):
+    """One normalised item of a ``set_active_batch`` request list.
+
+    Only ``key_id`` and ``version`` are accepted as required fields; the
+    optional ``expected_active`` defaults to ``None`` (no active-version
+    precondition). Unlike ``load_batch``, a key_id may appear at most once:
+    two pointer moves for the same key in one commit would be one ambiguous
+    pointer, so the whole batch is rejected up front.
+    """
+
+    key_id: str
+    version: int
+    expected_active: int | None = None
+
+
 def _record_field(record: dict, name: str):
     if not isinstance(record, dict) or name not in record:
         raise CorruptRecordError(f"记录损坏：字段 {name} 缺失或参数不全")
@@ -585,6 +600,51 @@ class KeyRing:
                                            password=password))
         return normalised
 
+    @staticmethod
+    def _check_set_active_requests(requests) -> list[_SetActiveRequest]:
+        """Validate and normalise a whole ``set_active_batch`` before storage.
+
+        The outer value must be a non-empty list of plain dicts; every item
+        must name exactly ``key_id`` and ``version`` plus an optional
+        ``expected_active``. ``version`` must be a non-bool positive integer
+        (it is required -- there is no "stay active" default), and
+        ``expected_active`` must be ``None``/omitted (no precondition) or a
+        non-bool positive integer. A ``key_id`` may appear only once. The
+        caller's objects are only read, never copied from or mutated: the
+        returned tuples are what the commit phase works from.
+        """
+        if not isinstance(requests, list) or not requests:
+            raise ValueError("requests must be a non-empty list")
+        allowed = frozenset(_SetActiveRequest._fields)
+        normalised: list[_SetActiveRequest] = []
+        seen: set[str] = set()
+        for request in requests:
+            if not isinstance(request, dict):
+                raise ValueError("each request must be a dict")
+            fields = request.keys()
+            unknown = fields - allowed
+            if unknown:
+                raise ValueError(f"unknown field {next(iter(unknown))!r}")
+            if "key_id" not in request:
+                raise ValueError("missing field 'key_id'")
+            if "version" not in request:
+                raise ValueError("missing field 'version'")
+            key_id = KeyRing._check_key_id(request["key_id"])
+            if key_id in seen:
+                raise ValueError(f"duplicate key_id {key_id!r} in batch")
+            seen.add(key_id)
+            version = KeyRing._check_version(request["version"])
+            # _check_version accepts None for load-style defaults; the target
+            # version here is a required explicit pointer.
+            if version is None:
+                raise ValueError("version must be a positive integer")
+            expected_active = KeyRing._check_expected_active(
+                request.get("expected_active"))
+            normalised.append(_SetActiveRequest(
+                key_id=key_id, version=version,
+                expected_active=expected_active))
+        return normalised
+
     def _entry(self, document: dict, key_id: str) -> dict:
         # The whole document (this entry included) was validated by _read()
         # under the same lock snapshot; here we only resolve the key.
@@ -917,6 +977,82 @@ class KeyRing:
             self._record_in(entry, key_id, version)
             entry["active"] = int(version)
             self._write(document)
+
+    def set_active_batch(self, requests) -> None:
+        """Move several keys' active pointers in one atomic change.
+
+        Python API only: there is no CLI subcommand. ``requests`` is a
+        non-empty list of dicts; each item requires ``key_id`` and
+        ``version`` and may additionally name only ``expected_active``.
+        ``version`` must be a non-bool positive integer naming an existing
+        historical version, and ``expected_active`` (omitted/``None`` means
+        no check) must be ``None`` or a non-bool positive integer. Bad
+        structure, non-dict items, missing or unknown fields, illegal values
+        and a repeated ``key_id`` all raise ``ValueError`` for the whole
+        batch before storage is touched, and the caller's objects are never
+        mutated.
+
+        Every item is judged against one committed snapshot: the whole store
+        is structurally validated first (damage in an unrequested record
+        still raises ``CorruptRecordError``), then items are checked in
+        request order -- key existence (``KeyError``), the
+        ``expected_active`` precondition compared against the current active
+        *number* only (``ActiveVersionConflictError``; the expected version
+        need not exist, mirroring rotation conflicts), target existence
+        (``KeyError``) and that the target is not revoked
+        (``RevokedVersionError``). The first failure aborts the batch
+        before any pointer moves, so ``keyring.json`` keeps its exact prior
+        bytes. A target that is already active still runs through every
+        check; when no item needs a move the document is not rewritten.
+
+        On success all pointers are repointed together with one atomic
+        replace: no versions or sealing material are added, other keys,
+        histories and revocation marks are untouched, and a concurrent
+        ``load_batch`` or any other caller observes only the state before
+        the batch or after it. Two batches expecting the same old active of
+        a shared key and moving it elsewhere cannot both succeed: the
+        second sees the committed pointer and reports the conflict.
+        A missing store raises ``FileNotFoundError``, waiting over five
+        seconds for the write lock raises ``TimeoutError``, and other
+        storage failures propagate as ``OSError``.
+        """
+        normalised = self._check_set_active_requests(requests)
+        # One exclusive lock for the whole batch, exactly like
+        # rotate_password_batch: the snapshot, every per-item check and the
+        # single atomic commit share one critical section, so concurrent
+        # callers observe either the pre-batch pointers or the post-batch
+        # pointers and no failure path can persist part of the move.
+        with _locked(self, exclusive=True):
+            document = self._read()
+            # Resolve every item in request order first; the first failure
+            # (unknown key, active conflict, unknown target, revoked target)
+            # aborts before any pointer is moved anywhere.
+            resolved: list[tuple[dict, int]] = []
+            changed = False
+            for request in normalised:
+                entry = self._entry(document, request.key_id)
+                # Per item, in request order: key lookup, then the active
+                # precondition, then target existence and revocation -- the
+                # same precedence the single-key rotation batch uses.
+                self._check_active_precondition(
+                    entry, request.key_id, request.expected_active)
+                record = self._record_in(entry, request.key_id, request.version)
+                # set_active() may still point at a revoked version; the
+                # batch switch deliberately may not, and uses load's verdict
+                # and wording for it.
+                if record.get("revoked"):
+                    raise RevokedVersionError(
+                        f"version {request.version!r} of {request.key_id!r} 已吊销")
+                if request.version != int(entry["active"]):
+                    changed = True
+                resolved.append((entry, request.version))
+            # Every check passed: repoint together. Distinct key_ids (checked
+            # up front) mean each entry appears at most once, so the moves
+            # can never fight over one pointer.
+            if changed:
+                for entry, version in resolved:
+                    entry["active"] = version
+                self._write(document)
 
     def revoke(self, key_id: str, version: int) -> None:
         key_id = self._check_key_id(key_id)
