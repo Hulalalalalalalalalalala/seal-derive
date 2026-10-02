@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 __all__ = ["KeyRing"]
 
@@ -138,6 +139,24 @@ class RevokedVersionError(ValueError):
     Not a :class:`SealError`: this is an invalid use rather than a storage or
     verification failure, so the CLI reports it as a usage error (exit 2).
     """
+
+
+class _BatchRequest(NamedTuple):
+    """One normalised item of a ``rotate_password_batch`` request list.
+
+    Defaults and allowed fields mirror ``rotate_password`` exactly: only
+    ``key_id`` and ``new_password`` are required; the old ``password`` defaults
+    to ``None`` (active sources are plain in the un-sealed case, otherwise the
+    sealed check reports the missing passphrase), ``version`` to active,
+    ``iterations`` to 200_000 and ``revoke_source`` to ``False``.
+    """
+
+    key_id: str
+    new_password: str
+    password: str | None = None
+    version: int | None = None
+    iterations: int = 200_000
+    revoke_source: bool = False
 
 
 def _record_field(record: dict, name: str):
@@ -422,6 +441,56 @@ class KeyRing:
             raise ValueError("version must be a positive integer")
         return version
 
+    @staticmethod
+    def _check_batch_requests(requests) -> list[_BatchRequest]:
+        """Validate and normalise a whole batch before any storage is touched.
+
+        The outer value must be a non-empty list of plain dicts; every item
+        must name exactly ``key_id`` and ``new_password`` plus any subset of
+        ``password``/``version``/``iterations``/``revoke_source``. Per-field
+        rules and defaults are identical to ``rotate_password``, and a
+        ``key_id`` may only appear once in the batch. The caller's objects are
+        only read, never copied from or mutated: the returned tuples are what
+        the commit phase works from.
+        """
+        if not isinstance(requests, list) or not requests:
+            raise ValueError("requests must be a non-empty list")
+        allowed = frozenset(_BatchRequest._fields)
+        required = ("key_id", "new_password")
+        normalised: list[_BatchRequest] = []
+        seen: set[str] = set()
+        for request in requests:
+            if not isinstance(request, dict):
+                raise ValueError("each request must be a dict")
+            fields = request.keys()
+            unknown = fields - allowed
+            if unknown:
+                raise ValueError(f"unknown field {next(iter(unknown))!r}")
+            missing = [name for name in required if name not in request]
+            if missing:
+                raise ValueError(f"missing field {missing[0]!r}")
+            key_id = KeyRing._check_key_id(request["key_id"])
+            if key_id in seen:
+                raise ValueError(f"duplicate key_id {key_id!r} in batch")
+            seen.add(key_id)
+            new_password = request["new_password"]
+            if not isinstance(new_password, str):
+                raise ValueError("new_password must be a string")
+            password = request.get("password")
+            if password is not None and not isinstance(password, str):
+                raise ValueError("password must be a string or None")
+            version = KeyRing._check_version(request.get("version"))
+            iterations = request.get("iterations", 200_000)
+            if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
+                raise ValueError("iterations must be positive")
+            revoke_source = request.get("revoke_source", False)
+            if not isinstance(revoke_source, bool):
+                raise ValueError("revoke_source must be a boolean")
+            normalised.append(_BatchRequest(
+                key_id=key_id, new_password=new_password, password=password,
+                version=version, iterations=iterations, revoke_source=revoke_source))
+        return normalised
+
     def _entry(self, document: dict, key_id: str) -> dict:
         # The whole document (this entry included) was validated by _read()
         # under the same lock snapshot; here we only resolve the key.
@@ -530,6 +599,63 @@ class KeyRing:
                 source["revoked"] = True
             self._write(document)
         return new_version
+
+    def rotate_password_batch(self, requests) -> list[int]:
+        """Rotate several keys in one key ring as a single change.
+
+        ``requests`` is a non-empty list of dicts with the same fields as
+        :meth:`rotate_password` (``key_id`` and ``new_password`` required); the
+        whole list is structurally validated first, without touching storage.
+        Every item is then resolved against one committed snapshot: the source
+        version (active by default) is authenticated with ``load``'s exact
+        order and verdicts, and its material bytes are re-sealed as a fresh v2
+        record using a new salt. The version number is that key's own
+        history max plus one; each new version is unrevoked and active, and
+        only that item's ``revoke_source`` revokes its source. Failures are
+        reported in request order and abort the batch before any mutation, so
+        ``keyring.json`` keeps its exact prior bytes. On success one atomic
+        replace commits every item, and the new version numbers are returned
+        in request order.
+        """
+        normalised = self._check_batch_requests(requests)
+        # One exclusive lock for the entire batch: concurrent callers observe
+        # only the snapshot before the batch or the document after it commits,
+        # never a partially applied list. All reads, authentications and the
+        # single atomic write happen against that one snapshot, so nothing is
+        # re-read per item and no failure path can persist part of the batch.
+        with _locked(self, exclusive=True):
+            document = self._read()
+            # Resolve every item in request order first; the first failure
+            # (unknown key/version, revoked/unrecoverable source, missing or
+            # bad passphrase, failed authentication) aborts before the
+            # document is mutated anywhere.
+            resolved: list[tuple[_BatchRequest, dict, dict, bytes, int]] = []
+            for request in normalised:
+                entry = self._entry(document, request.key_id)
+                source = self._record_in(entry, request.key_id, request.version)
+                plaintext = self._material_from(
+                    source, request.key_id, request.password)
+                new_version = max(
+                    (self._version_number(item, request.key_id)
+                     for item in entry["versions"]), default=0) + 1
+                resolved.append((request, entry, source, plaintext, new_version))
+            # Every source authenticated: now build and append the fresh v2
+            # records. Distinct key_ids within the batch (checked up front)
+            # mean each entry is touched by at most one item, so the per-key
+            # max-plus-one numbers computed above cannot collide.
+            new_versions: list[int] = []
+            for request, entry, source, plaintext, new_version in resolved:
+                record = self._sealed_v2_record(
+                    new_version, request.key_id, plaintext,
+                    request.new_password, request.iterations)
+                record["revoked"] = False
+                entry["versions"].append(record)
+                entry["active"] = new_version
+                if request.revoke_source:
+                    source["revoked"] = True
+                new_versions.append(new_version)
+            self._write(document)
+        return new_versions
 
     def versions(self, key_id: str) -> list[int]:
         self._check_key_id(key_id)
