@@ -141,6 +141,19 @@ class RevokedVersionError(ValueError):
     """
 
 
+class _LoadRequest(NamedTuple):
+    """One normalised item of a ``load_batch`` request list.
+
+    Only ``key_id`` is required; ``version`` defaults to ``None`` (active) and
+    ``password`` to ``None``, with the same rules as ``load``. The same key
+    may appear more than once, requesting different historical versions.
+    """
+
+    key_id: str
+    version: int | None = None
+    password: str | None = None
+
+
 class _BatchRequest(NamedTuple):
     """One normalised item of a ``rotate_password_batch`` request list.
 
@@ -491,6 +504,40 @@ class KeyRing:
                 version=version, iterations=iterations, revoke_source=revoke_source))
         return normalised
 
+    @staticmethod
+    def _check_load_requests(requests) -> list[_LoadRequest]:
+        """Validate and normalise a whole batch before any storage is touched.
+
+        The outer value must be a non-empty list of plain dicts; every item
+        must name ``key_id`` and may name only ``version`` and ``password``.
+        Per-field rules and defaults are identical to ``load`` (version
+        defaults to active, password to ``None``). A ``key_id`` may repeat,
+        including the same key at different historical versions. The caller's
+        objects are only read, never mutated: the returned tuples are what the
+        read phase works from.
+        """
+        if not isinstance(requests, list) or not requests:
+            raise ValueError("requests must be a non-empty list")
+        allowed = frozenset(_LoadRequest._fields)
+        normalised: list[_LoadRequest] = []
+        for request in requests:
+            if not isinstance(request, dict):
+                raise ValueError("each request must be a dict")
+            fields = request.keys()
+            unknown = fields - allowed
+            if unknown:
+                raise ValueError(f"unknown field {next(iter(unknown))!r}")
+            if "key_id" not in request:
+                raise ValueError("missing field 'key_id'")
+            key_id = KeyRing._check_key_id(request["key_id"])
+            version = KeyRing._check_version(request.get("version"))
+            password = request.get("password")
+            if password is not None and not isinstance(password, str):
+                raise ValueError("password must be a string or None")
+            normalised.append(_LoadRequest(
+                key_id=key_id, version=version, password=password))
+        return normalised
+
     def _entry(self, document: dict, key_id: str) -> dict:
         # The whole document (this entry included) was validated by _read()
         # under the same lock snapshot; here we only resolve the key.
@@ -694,6 +741,46 @@ class KeyRing:
             entry = self._entry(self._read(), key_id)
             record = self._record_in(entry, key_id, version)
             return self._material_from(record, key_id, password)
+
+    def load_batch(self, requests) -> list[bytes]:
+        """Load several materials from one key ring against a single snapshot.
+
+        ``requests`` is a non-empty list of dicts; each item requires
+        ``key_id`` and may additionally name only ``version`` and ``password``,
+        with ``load``'s defaults (active version, ``None`` passphrase) and the
+        same type rules. A key may appear more than once, including different
+        historical versions of it. The whole list is structurally validated
+        before storage is touched.
+
+        Every item is resolved against one committed document read under a
+        single shared lock: the version (including each default ``active``),
+        revocation state and decryption all see that snapshot, so a concurrent
+        batch rotation is visible either wholly before or wholly after this
+        call, and a ``set_active``/``revoke`` can only take effect before the
+        batch starts or after it ends. The whole document is validated first,
+        including records no item requests. Items are then opened in request
+        order with ``load``'s exact verdicts; the first failure aborts the
+        batch and returns no partial material. On success the materials are
+        returned in request order, duplicates preserved, with the same bytes
+        as ``load``. The store is never written: no version is added and no
+        active pointer or revocation marker changes.
+        """
+        normalised = self._check_load_requests(requests)
+        # One shared-lock snapshot for the whole batch: every version
+        # resolution, revocation check and decryption sees the same committed
+        # document, and no writer (batch rotation, set-active, revoke) can
+        # commit while the batch is open. Nothing here mutates the snapshot, so
+        # keyring.json is never rewritten on either the success or the failure
+        # path.
+        with _locked(self, exclusive=False):
+            document = self._read()
+            materials: list[bytes] = []
+            for request in normalised:
+                entry = self._entry(document, request.key_id)
+                record = self._record_in(entry, request.key_id, request.version)
+                materials.append(
+                    self._material_from(record, request.key_id, request.password))
+            return materials
 
     # Call only while holding the load snapshot: the record is fresh from the
     # document read under the shared lock and no writer can commit until this
